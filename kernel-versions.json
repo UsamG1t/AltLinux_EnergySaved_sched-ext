@@ -1,0 +1,34 @@
+{
+  "sched_ext/for-next": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/tj/sched_ext.git",
+    "branch": "for-next",
+    "commitHash": "579a3297b268f0281644ead7ff574a2b4bc64d3c",
+    "lastModified": 1765598236,
+    "narHash": "sha256-5utnaTOtmoTh+iDFBhPA8fdNiPcJ8uJFkqR8RWdIla4=",
+    "kernelVersion": "6.18.0"
+  },
+  "bpf/bpf-next": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git",
+    "branch": "master",
+    "commitHash": "759377dab35e404fc4f013e3f853d6e9450b4633",
+    "lastModified": 1765426010,
+    "narHash": "sha256-Cr8wRVjJW+PKju3LWCwlFKhyhhYRg9O2hvAx04kL5N0=",
+    "kernelVersion": "6.18.0"
+  },
+  "stable/6_12": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "branch": "linux-6.12.y",
+    "commitHash": "dcbeffaf66d03968970d7d68ec7800032d00180e",
+    "lastModified": 1765080382,
+    "narHash": "sha256-D1koYfjGqUABLHeAH7KOss3OMv13g8vDzAT+kCjV8bs=",
+    "kernelVersion": "6.12.61"
+  },
+  "stable/linux-rolling-stable": {
+    "repo": "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git",
+    "branch": "linux-rolling-stable",
+    "commitHash": "229acf052923efdb9e748d54f0bd6257a1be03d4",
+    "lastModified": 1765598235,
+    "narHash": "sha256-zSs4YlpHxMSzv2BQ8AXggePtu5aLypU+xBwpB44z8ew=",
+    "kernelVersion": "6.17.12"
+  }
+}
