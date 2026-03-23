@@ -39,6 +39,30 @@ static void sigint_handler(int dumb)
 	exit_req = 1;
 }
 
+static void read_freqs(struct scx_dumb *skel, __u32 *freqs)
+{
+	int nr_cpus = libbpf_num_possible_cpus();
+	assert(nr_cpus > 0);
+	__u32*  cnts = malloc(61 * sizeof(*cnts));
+	__u32 idx;
+
+	memset(freqs, 0, sizeof(freqs[0]) * 61);
+
+	for (idx = 0; idx < 61; idx++) {
+		int ret, cpu;
+
+		ret = bpf_map_lookup_elem(bpf_map__fd(skel->maps.freqs),
+					  &idx, cnts);
+		if (ret < 0)
+			continue;
+		// for (cpu = 0; cpu < 12; cpu++)
+			// freqs[idx] += cnts[idx];
+		freqs[idx] = cnts[idx];
+	}
+
+	free(cnts);
+}
+
 int main(int argc, char **argv)
 {
 	struct scx_dumb *skel;
@@ -64,6 +88,23 @@ restart:
 	}
 
 	SCX_OPS_LOAD(skel, dumb_ops, scx_dumb, uei);
+	if (!skel) {
+ 	   	fprintf(stderr, "Failed to load skeleton\n");
+    	return 1;
+	}
+
+	if (!skel->maps.freqs) {
+		fprintf(stderr, "Map 'freqs' not found in skeleton\n");
+		return 1;
+	}
+
+	int fd = bpf_map__fd(skel->maps.freqs);
+	if (fd < 0) {
+		fprintf(stderr, "Invalid map fd: %d\n", fd);
+		return 1;
+	}
+
+
 	link = SCX_OPS_ATTACH(skel, dumb_ops, scx_dumb);
 
 	time_t start_raw_time, now_raw_time, delta;
@@ -73,6 +114,19 @@ restart:
     time(&start_raw_time);
     time(&now_raw_time); 
 	
+	__u32 freqs[60] = {};
+
+	read_freqs(skel, freqs);
+
+	printf("Max = %ld\n", freqs[60]);
+
+	for (int i = 0; i < 5; i++) {
+		for (int cpu = 0; cpu < libbpf_num_possible_cpus(); cpu++) {
+			printf("%ld ", freqs[i*libbpf_num_possible_cpus() + cpu]);
+		}
+		printf("\n");
+	}
+
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		delta = now_raw_time - start_raw_time;
 		delta_info = localtime(&delta);

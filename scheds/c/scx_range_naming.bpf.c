@@ -8,7 +8,7 @@ const volatile bool fifo_sched;
 
 static u64 vtime_now;
 static u64 cpu_change_time_now;
-static u64 freq_step = 10;
+static u32 freq_step = 0;
 UEI_DEFINE(uei);
 
 /*
@@ -256,21 +256,18 @@ void BPF_STRUCT_OPS(range_naming_stopping, struct task_struct *p, bool runnable)
 void BPF_STRUCT_OPS(range_naming_enable, struct task_struct *p)
 {
 	u64 now = bpf_ktime_get_ns();
-	if (now - cpu_change_time_now > 10000000000) {
-		freq_step -= 1;
-		
-		if (!freq_step) {
-			return;
-		}
+	if (now - cpu_change_time_now > 20000000000ULL) {
+		freq_step = !freq_step;
+		u32 perf = freq_step ? SCX_CPUPERF_ONE : 0;
 
 		const struct cpumask* online = scx_bpf_get_online_cpumask();
 		
 		u32 cpu;
-		bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
+		bpf_for(cpu, ISOLATED_END, ISOLATED_END + 1) {
 			if (bpf_cpumask_test_cpu(cpu, online)) {
-				scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE / freq_step);
-				u8 valid = (scx_bpf_cpuperf_cur(cpu) == SCX_CPUPERF_ONE / freq_step);
-				bpf_map_update_elem(&valid_cpuperf, &cpu, &valid, BPF_ANY);
+				// bpf_rcu_read_lock();
+				scx_bpf_cpuperf_set(cpu, perf);
+				// bpf_rcu_read_unlock();
 			}
 		}
 
@@ -289,9 +286,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(range_naming_init)
 
     bpf_for(cpu, 0, scx_bpf_nr_cpu_ids()) {
         if (bpf_cpumask_test_cpu(cpu, online)) {
-			scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE / 10);
-			u8 valid = (scx_bpf_cpuperf_cur(cpu) == SCX_CPUPERF_ONE / 10);
-			bpf_map_update_elem(&valid_cpuperf, &cpu, &valid, BPF_ANY);
+			scx_bpf_cpuperf_set(cpu, 0);
 		}
     }
 
