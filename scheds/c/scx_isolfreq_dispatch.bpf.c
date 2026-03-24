@@ -181,15 +181,15 @@ void BPF_STRUCT_OPS(isolfreq_dispatch_dispatch, s32 cpu, struct task_struct *pre
         u32 new_perf = target_perf;
 
         // Проверяем, не пора ли переключить частоту (раз в 20 секунд)
-        if (now - last > 20000000000ULL) {
+        if (now - last > 2000000000ULL) {
             // Пытаемся атомарно обновить время последнего переключения
             u64 old = __sync_val_compare_and_swap(&last_switch_time, last, now);
             if (old == last) {
                 // Мы первый, кто переключает – меняем целевую частоту
-                new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE : 0;
+               // new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE : 0;
                 
-				// new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE / 2 : (
-				// 	(target_perf == SCX_CPUPERF_ONE / 2) ? SCX_CPUPERF_ONE : 0);
+				new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE / 2 : (
+				 	(target_perf == SCX_CPUPERF_ONE / 2) ? SCX_CPUPERF_ONE : 0);
                 target_perf = new_perf;
             } else {
                 // Другой CPU уже переключил – берём новое значение
