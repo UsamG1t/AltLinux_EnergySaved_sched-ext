@@ -8,6 +8,8 @@ const volatile bool fifo_sched;
 
 static u64 vtime_now;
 static volatile u64 last_switch_time = 0;
+static volatile u32 freq_range = 10;
+static volatile u32 freq_step = 0;
 static volatile u32 target_perf = 0;
 UEI_DEFINE(uei);
 
@@ -188,8 +190,11 @@ void BPF_STRUCT_OPS(isolfreq_dispatch_dispatch, s32 cpu, struct task_struct *pre
                 // Мы первый, кто переключает – меняем целевую частоту
                // new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE : 0;
                 
-				new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE / 2 : (
-				 	(target_perf == SCX_CPUPERF_ONE / 2) ? SCX_CPUPERF_ONE : 0);
+				// new_perf = (target_perf == 0) ? SCX_CPUPERF_ONE / 2 : (
+				//  	(target_perf == SCX_CPUPERF_ONE / 2) ? SCX_CPUPERF_ONE : 0);
+
+				freq_step = (freq_step + 1) % (freq_range + 1);
+				new_perf = SCX_CPUPERF_ONE * freq_step / freq_range;
                 target_perf = new_perf;
             } else {
                 // Другой CPU уже переключил – берём новое значение
