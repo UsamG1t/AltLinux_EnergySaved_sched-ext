@@ -16,7 +16,7 @@ UEI_DEFINE(uei);
  * use SCX_DSQ_GLOBAL.
  */
 #define SHARED_DSQ 0
-#define ISOLATED 11
+#define ISOLATED 8
 
 
 struct {
@@ -44,7 +44,7 @@ s32 BPF_STRUCT_OPS(naming_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 
 	char* name = p->comm;
 	if (!strncmp("var", name, 3)) {
-		return 11;
+		return 8;
 	}
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
@@ -60,7 +60,7 @@ s32 BPF_STRUCT_OPS(naming_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 	}
 
 	// -------------------------------------------------
-	/* Стандартный выбор дал 11 – ищем альтернативу */
+	/* Стандартный выбор дал 8 – ищем альтернативу */
 	s32 alt_cpu = -1;
 	s32 idle_cpu = -1;
 
@@ -86,8 +86,8 @@ s32 BPF_STRUCT_OPS(naming_select_cpu, struct task_struct *p, s32 prev_cpu, u64 w
 		cpu = alt_cpu;
 		is_idle = false;
 	} else {
-		/* Нет альтернатив – придётся использовать 11 */
-		cpu = 11;
+		/* Нет альтернатив – придётся использовать 8 */
+		cpu = 8;
 		is_idle = false;
 	}
 
@@ -163,7 +163,7 @@ void BPF_STRUCT_OPS(naming_enqueue, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(naming_dispatch, s32 cpu, struct task_struct *prev)
 {
 	
-	if (cpu != 11) {
+	if (cpu != 8) {
 		scx_bpf_dsq_move_to_local(SHARED_DSQ);
 	}
 }
@@ -208,11 +208,11 @@ void BPF_STRUCT_OPS(naming_enable, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(naming_init)
 {
 	s32 cpu;
-	bpf_for(cpu, 0, 11) {
+	bpf_for(cpu, 0, 12) {
 		scx_bpf_cpuperf_set(cpu, SCX_CPUPERF_ONE);
 	}
 	
-	scx_bpf_cpuperf_set(11, 0);
+	scx_bpf_cpuperf_set(8, 0);
 
     return scx_bpf_create_dsq(SHARED_DSQ, -1);
 	return scx_bpf_create_dsq(SHARED_DSQ, -1);
