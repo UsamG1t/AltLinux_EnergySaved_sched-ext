@@ -9,7 +9,7 @@ UEI_DEFINE(uei);
 #define ISOLATED_START 6
 #define ISOLATED_END 9
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
-#define NR_FREQ_STEPS 4
+#define NR_FREQ_STEPS 9
 #define POLICY_MAX_FREQ_KHZ 1800000
 #define STAIRS_COMM_LEN 16
 
@@ -23,15 +23,25 @@ enum stairs_debug_event {
 
 static const u32 stairs_freq_steps_khz[NR_FREQ_STEPS] = {
 	400000,
+	600000,
+	800000,
 	900000,
-	1400000,
+	1100000,
+	1300000,
+	1500000,
+	1600000,
 	1800000,
 };
 
 static const u32 stairs_perf_steps[NR_FREQ_STEPS] = {
 	48,
-	224,
-	384,
+	165,
+	256,
+	288,
+	352,
+	416,
+	480,
+	512,
 	576,
 };
 
@@ -141,6 +151,26 @@ static inline bool lookup_freq_step(u32 step_idx, u32 *freq_khz,
 	case 4:
 		*freq_khz = stairs_freq_steps_khz[3];
 		*perf_target = stairs_perf_steps[3];
+		return true;
+	case 5:
+		*freq_khz = stairs_freq_steps_khz[4];
+		*perf_target = stairs_perf_steps[4];
+		return true;
+	case 6:
+		*freq_khz = stairs_freq_steps_khz[5];
+		*perf_target = stairs_perf_steps[5];
+		return true;
+	case 7:
+		*freq_khz = stairs_freq_steps_khz[6];
+		*perf_target = stairs_perf_steps[6];
+		return true;
+	case 8:
+		*freq_khz = stairs_freq_steps_khz[7];
+		*perf_target = stairs_perf_steps[7];
+		return true;
+	case 9:
+		*freq_khz = stairs_freq_steps_khz[8];
+		*perf_target = stairs_perf_steps[8];
 		return true;
 	default:
 		return false;
