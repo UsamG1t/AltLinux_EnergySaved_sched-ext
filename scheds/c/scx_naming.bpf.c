@@ -6,6 +6,8 @@ char _license[] SEC("license") = "GPL";
 const volatile bool fifo_sched;
 
 static u64 vtime_now;
+static volatile u64 last_perf_step_at;
+static volatile u32 perf_step;
 UEI_DEFINE(uei);
 
 /*
@@ -17,6 +19,8 @@ UEI_DEFINE(uei);
  */
 #define SHARED_DSQ 0
 #define ISOLATED 8
+#define PERF_STEP_INTERVAL_NS 5000000000ULL
+#define PERF_STEP_MAX 1
 
 
 struct {
@@ -168,6 +172,43 @@ void BPF_STRUCT_OPS(naming_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
+void BPF_STRUCT_OPS(naming_tick, struct task_struct *p)
+{
+	char *name = p->comm;
+	u64 now, last, old;
+	u32 step;
+
+	if (strncmp("var", name, 3))
+		return;
+
+	now = bpf_ktime_get_ns();
+	last = last_perf_step_at;
+	step = perf_step;
+
+	if (!last) {
+		old = __sync_val_compare_and_swap(&last_perf_step_at, 0, now);
+		if (!old) {
+			scx_bpf_cpuperf_set(scx_bpf_task_cpu(p),
+					    SCX_CPUPERF_ONE * step / PERF_STEP_MAX);
+			return;
+		}
+		last = old;
+	}
+
+	if (now - last >= PERF_STEP_INTERVAL_NS) {
+		old = __sync_val_compare_and_swap(&last_perf_step_at, last, now);
+		if (old == last) {
+			step = (perf_step + 1) % (PERF_STEP_MAX + 1);
+			perf_step = step;
+		} else {
+			step = perf_step;
+		}
+	}
+
+	scx_bpf_cpuperf_set(scx_bpf_task_cpu(p),
+			    SCX_CPUPERF_ONE * step / PERF_STEP_MAX);
+}
+
 void BPF_STRUCT_OPS(naming_running, struct task_struct *p)
 {
 	if (fifo_sched)
@@ -227,6 +268,7 @@ SCX_OPS_DEFINE(naming_ops,
 	       .select_cpu		= (void *)naming_select_cpu,
 	       .enqueue			= (void *)naming_enqueue,
 	       .dispatch		= (void *)naming_dispatch,
+	       .tick			= (void *)naming_tick,
 	       .running			= (void *)naming_running,
 	       .stopping		= (void *)naming_stopping,
 	       .enable			= (void *)naming_enable,

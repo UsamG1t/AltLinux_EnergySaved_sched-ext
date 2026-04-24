@@ -182,7 +182,7 @@ void BPF_STRUCT_OPS(isolfreq_dispatch_dispatch, s32 cpu, struct task_struct *pre
         u64 last = last_switch_time;
         u32 new_perf = target_perf;
 
-        // Проверяем, не пора ли переключить частоту (раз в 20 секунд)
+        // Проверяем, не пора ли переключить частоту (раз в 2 секунды)
         if (now - last > 2000000000ULL) {
             // Пытаемся атомарно обновить время последнего переключения
             u64 old = __sync_val_compare_and_swap(&last_switch_time, last, now);

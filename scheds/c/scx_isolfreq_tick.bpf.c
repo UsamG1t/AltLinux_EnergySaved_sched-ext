@@ -266,17 +266,17 @@ void BPF_STRUCT_OPS(isolfreq_tick_enable, struct task_struct *p)
 
 void BPF_STRUCT_OPS(isolfreq_tick_update_idle, s32 cpu, bool idle)
 {
-	u32 zero = 0;
-	u32 *last_set;
+	// u32 zero = 0;
+	// u32 *last_set;
 
-	if (!idle || !is_isolated_cpu(cpu))
-		return;
+	// if (!idle || !is_isolated_cpu(cpu))
+	// 	return;
 
-	scx_bpf_cpuperf_set(cpu, 0);
+	// scx_bpf_cpuperf_set(cpu, 0);
 
-	last_set = bpf_map_lookup_elem(&last_set_perf, &zero);
-	if (last_set)
-		*last_set = 0;
+	// last_set = bpf_map_lookup_elem(&last_set_perf, &zero);
+	// if (last_set)
+	// 	*last_set = 0;
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(isolfreq_tick_init)
