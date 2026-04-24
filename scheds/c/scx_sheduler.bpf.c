@@ -1,5 +1,7 @@
 #include <scx/common.bpf.h>
 
+#include "scx_sheduler_sched.h"
+
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
@@ -8,40 +10,25 @@ UEI_DEFINE(uei);
 #define ISOLATED_START 6
 #define ISOLATED_END 9
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
-#define NR_FREQ_STEPS 9
 
-static const u32 sheduler_freq_steps_khz[NR_FREQ_STEPS] = {
-	400000,
-	600000,
-	800000,
-	900000,
-	1100000,
-	1300000,
-	1500000,
-	1600000,
-	1800000,
+struct sheduler_task_name {
+	u32 task_id;
+	u32 runtime_ms;
 };
 
-static const u32 sheduler_perf_steps[NR_FREQ_STEPS] = {
-	48,
-	165,
-	256,
-	288,
-	352,
-	416,
-	480,
-	512,
-	576,
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, SHEDULER_MAX_TASKS);
+	__type(key, __u32);
+	__type(value, struct sheduler_task_plan);
+} task_plans SEC(".maps");
 
-struct var_task_spec {
-	bool has_freq_target;
-	u16 cpu_start;
-	u16 cpu_end;
-	u16 freq_step_idx;
-	u32 target_freq_khz;
-	u32 perf_target;
-};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct sheduler_schedule_control);
+} schedule_control SEC(".maps");
 
 static inline bool is_dec(char c)
 {
@@ -53,217 +40,89 @@ static inline bool is_isolated_cpu(s32 cpu)
 	return cpu >= ISOLATED_START && cpu <= ISOLATED_END;
 }
 
-static inline bool parse_cpu_start(const char *name, u32 *value, int *next)
+static inline bool parse_sched_task_name(const char *name,
+					 struct sheduler_task_name *task_name)
 {
-	char c0 = name[4];
-	char c1 = name[5];
-	char c2 = name[6];
+	u32 task_id = 0;
+	u32 runtime_ms = 0;
+	bool seen_id = false;
+	bool seen_runtime = false;
+	bool parsing_runtime = false;
+	int i;
 
-	if (!is_dec(c0))
+	if (name[0] != 't' || name[1] != 'a' || name[2] != 's' ||
+	    name[3] != 'k')
 		return false;
 
-	if (c1 == '_') {
-		*value = c0 - '0';
-		*next = 6;
-		return true;
+	#pragma unroll
+	for (i = 4; i < SHEDULER_TASK_COMM_LEN; i++) {
+		char c = name[i];
+
+		if (!parsing_runtime) {
+			if (c == '_') {
+				if (!seen_id)
+					return false;
+				parsing_runtime = true;
+				continue;
+			}
+			if (!is_dec(c))
+				return false;
+			seen_id = true;
+			task_id = task_id * 10 + (c - '0');
+			continue;
+		}
+
+		if (c == '\0') {
+			if (!seen_runtime)
+				return false;
+			task_name->task_id = task_id;
+			task_name->runtime_ms = runtime_ms;
+			return true;
+		}
+
+		if (!is_dec(c))
+			return false;
+		seen_runtime = true;
+		runtime_ms = runtime_ms * 10 + (c - '0');
 	}
 
-	if (!is_dec(c1) || c2 != '_')
-		return false;
-
-	*value = (c0 - '0') * 10 + (c1 - '0');
-	*next = 7;
-	return true;
-}
-
-static inline bool parse_cpu_end(const char *name, int idx, u32 *value, int *next)
-{
-	char c0 = name[idx];
-	char c1 = name[idx + 1];
-	char c2 = name[idx + 2];
-
-	if (!is_dec(c0))
-		return false;
-
-	if (c1 == '\0' || c1 == '_') {
-		*value = c0 - '0';
-		*next = idx + 1;
-		return true;
-	}
-
-	if (!is_dec(c1) || (c2 != '\0' && c2 != '_'))
-		return false;
-
-	*value = (c0 - '0') * 10 + (c1 - '0');
-	*next = idx + 2;
-	return true;
-}
-
-static inline bool parse_freq_step(const char *name, int idx, u32 *value)
-{
-	char c0 = name[idx];
-	char c1 = name[idx + 1];
-
-	if (!is_dec(c0))
-		return false;
-	if (c1 != '\0')
-		return false;
-
-	*value = c0 - '0';
-	return true;
-}
-
-// static inline bool lookup_freq_step(u32 step_idx, u32 *freq_khz, u32 *perf_target)
-// {
-// 	switch (step_idx) {
-// 	case 1:
-// 		*freq_khz = sheduler_freq_steps_khz[0];
-// 		*perf_target = sheduler_perf_steps[0];
-// 		return true;
-// 	case 2:
-// 		*freq_khz = sheduler_freq_steps_khz[1];
-// 		*perf_target = sheduler_perf_steps[1];
-// 		return true;
-// 	case 3:
-// 		*freq_khz = sheduler_freq_steps_khz[2];
-// 		*perf_target = sheduler_perf_steps[2];
-// 		return true;
-// 	case 4:
-// 		*freq_khz = sheduler_freq_steps_khz[3];
-// 		*perf_target = sheduler_perf_steps[3];
-// 		return true;
-// 	case 5:
-// 		*freq_khz = sheduler_freq_steps_khz[4];
-// 		*perf_target = sheduler_perf_steps[4];
-// 		return true;
-// 	case 6:
-// 		*freq_khz = sheduler_freq_steps_khz[5];
-// 		*perf_target = sheduler_perf_steps[5];
-// 		return true;
-// 	case 7:
-// 		*freq_khz = sheduler_freq_steps_khz[6];
-// 		*perf_target = sheduler_perf_steps[6];
-// 		return true;
-// 	case 8:
-// 		*freq_khz = sheduler_freq_steps_khz[7];
-// 		*perf_target = sheduler_perf_steps[7];
-// 		return true;
-// 	case 9:
-// 		*freq_khz = sheduler_freq_steps_khz[8];
-// 		*perf_target = sheduler_perf_steps[8];
-// 		return true;
-// 	default:
-// 		return false;
-// 	}
-// }
-
-static inline bool lookup_freq_step(u32 step_idx, u32 *freq_khz, u32 *perf_target)
-{
-	if (step_idx >= 1 && step_idx <= 9) {
-		*freq_khz = sheduler_freq_steps_khz[0];
-		*perf_target = sheduler_perf_steps[0];
-		return true;
-	}
 	return false;
 }
 
-
-static inline bool parse_var_task_name(const char *name, struct var_task_spec *spec)
+static inline bool lookup_task_plan(const struct task_struct *p,
+				    struct sheduler_task_plan *plan)
 {
-	u32 cpu_start;
-	u32 cpu_end;
-	u32 step_idx;
-	int next;
+	struct sheduler_task_name task_name;
+	struct sheduler_task_plan *map_plan;
 
-	__builtin_memset(spec, 0, sizeof(*spec));
-
-	if (name[0] != 'v' || name[1] != 'a' || name[2] != 'r' || name[3] != '_')
-		return false;
-	if (!parse_cpu_start(name, &cpu_start, &next))
-		return false;
-	if (!parse_cpu_end(name, next, &cpu_end, &next))
-		return false;
-	if (name[next] != '\0' && name[next] != '_')
-		return false;
-	if (cpu_start > cpu_end)
+	if (!parse_sched_task_name(p->comm, &task_name))
 		return false;
 
-	spec->cpu_start = cpu_start;
-	spec->cpu_end = cpu_end;
-
-	if (name[next] == '\0')
-		return true;
-
-	if (!parse_freq_step(name, next + 1, &step_idx))
+	map_plan = bpf_map_lookup_elem(&task_plans, &task_name.task_id);
+	if (!map_plan)
 		return false;
-	if (!lookup_freq_step(step_idx, &spec->target_freq_khz, &spec->perf_target))
+	if (map_plan->runtime_ms != task_name.runtime_ms)
 		return false;
 
-	spec->has_freq_target = true;
-	spec->freq_step_idx = step_idx;
+	*plan = *map_plan;
 	return true;
+}
+
+static inline bool planned_cpu_allowed(const struct task_struct *p, s32 cpu)
+{
+	const struct cpumask *online;
+	bool allowed;
+
+	online = scx_bpf_get_online_cpumask();
+	allowed = bpf_cpumask_test_cpu(cpu, online) &&
+		  bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+	scx_bpf_put_cpumask(online);
+	return allowed;
 }
 
 static inline bool is_pinned(const struct task_struct *p)
 {
 	return p->nr_cpus_allowed == 1;
-}
-
-static inline bool can_run_on_isolated_cpu(const struct task_struct *p,
-					   const struct cpumask *online,
-					   const struct var_task_spec *spec,
-					   s32 cpu)
-{
-	if (cpu < spec->cpu_start || cpu > spec->cpu_end)
-		return false;
-	if (!bpf_cpumask_test_cpu(cpu, online))
-		return false;
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-		return false;
-	return true;
-}
-
-static inline s32 first_allowed_isolated_cpu(const struct task_struct *p,
-					     const struct var_task_spec *spec)
-{
-	const struct cpumask *online = scx_bpf_get_online_cpumask();
-	s32 cpu = -1;
-	int i;
-
-	#pragma unroll
-	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		s32 candidate = ISOLATED_START + i;
-
-		if (!can_run_on_isolated_cpu(p, online, spec, candidate))
-			continue;
-		cpu = candidate;
-		break;
-	}
-
-	scx_bpf_put_cpumask(online);
-	return cpu;
-}
-
-static inline s32 pick_allowed_isolated_cpu(const struct task_struct *p,
-					    const struct var_task_spec *spec)
-{
-	const struct cpumask *online = scx_bpf_get_online_cpumask();
-	s32 cpu = -1;
-	u32 start = bpf_get_prandom_u32() % NR_ISOLATED_CPUS;
-	int i;
-
-	#pragma unroll
-	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		s32 candidate = ISOLATED_START + ((start + i) % NR_ISOLATED_CPUS);
-
-		if (!can_run_on_isolated_cpu(p, online, spec, candidate))
-			continue;
-		cpu = candidate;
-		break;
-	}
-
-	scx_bpf_put_cpumask(online);
-	return cpu;
 }
 
 static inline s32 pick_non_isolated_cpu(const struct task_struct *p, bool *is_idle)
@@ -311,15 +170,12 @@ static inline void set_cpuperf_target(s32 cpu, u32 perf_target)
 s32 BPF_STRUCT_OPS(sheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	struct var_task_spec spec;
+	struct sheduler_task_plan plan;
 	bool is_idle = false;
 	s32 cpu;
 
-	if (parse_var_task_name(p->comm, &spec)) {
-		cpu = first_allowed_isolated_cpu(p, &spec);
-		if (cpu >= 0)
-			return cpu;
-	}
+	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu))
+		return plan.cpu;
 
 	cpu = pick_non_isolated_cpu(p, &is_idle);
 	if (cpu >= 0) {
@@ -337,16 +193,13 @@ s32 BPF_STRUCT_OPS(sheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(sheduler_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct var_task_spec spec;
+	struct sheduler_task_plan plan;
 	s32 cpu;
 
-	if (parse_var_task_name(p->comm, &spec)) {
-		cpu = pick_allowed_isolated_cpu(p, &spec);
-		if (cpu >= 0) {
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
-					   SCX_SLICE_DFL, enq_flags);
-			return;
-		}
+	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | plan.cpu, SCX_SLICE_DFL,
+				   enq_flags);
+		return;
 	}
 
 	if (is_pinned(p)) {
@@ -369,14 +222,14 @@ void BPF_STRUCT_OPS(sheduler_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(sheduler_running, struct task_struct *p)
 {
-	struct var_task_spec spec;
+	struct sheduler_task_plan plan;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu))
 		return;
 
-	if (parse_var_task_name(p->comm, &spec) && spec.has_freq_target) {
-		set_cpuperf_target(cpu, spec.perf_target);
+	if (lookup_task_plan(p, &plan) && cpu == (s32)plan.cpu) {
+		set_cpuperf_target(cpu, plan.perf_target);
 		return;
 	}
 
