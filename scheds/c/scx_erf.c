@@ -24,6 +24,7 @@
 #define MAX_TIME_IN_STATE_STEPS 64
 #define MAX_FREQ_KHZ 1800000U
 #define MIN_FREQ_KHZ 400000U
+#define ERF_SLACK_PCT 0U
 
 #define LOG_DIR "/tmp/scx_erf"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
@@ -812,6 +813,30 @@ static __u64 task_duration_ns(__u32 runtime_ms, __u32 freq_khz)
 			    freq_khz);
 }
 
+static __u64 padded_slot_ns(__u32 runtime_ms)
+{
+	__u64 base_duration_ns = (__u64)runtime_ms * 1000000ULL;
+
+	if (!ERF_SLACK_PCT)
+		return base_duration_ns;
+
+	return ceil_div_u64(base_duration_ns * 100ULL, 100ULL - ERF_SLACK_PCT);
+}
+
+static __u64 apply_schedule_slack(__u64 window_ns)
+{
+	__u64 reserve_ns;
+
+	if (!window_ns || !ERF_SLACK_PCT)
+		return window_ns;
+
+	reserve_ns = ceil_div_u64(window_ns * ERF_SLACK_PCT, 100);
+	if (reserve_ns >= window_ns)
+		return 1;
+
+	return window_ns - reserve_ns;
+}
+
 static const struct freq_step *find_step_for_required_khz(__u32 required_khz)
 {
 	size_t i;
@@ -833,7 +858,7 @@ static size_t choose_earliest_finish_cpu(const struct cpu_plan_state *cpus,
 					 __u64 *end_ns_out)
 {
 	__u64 ready_ns = (__u64)task->ready_ms * 1000000ULL;
-	__u64 base_duration_ns = (__u64)task->runtime_ms * 1000000ULL;
+	__u64 base_duration_ns = padded_slot_ns(task->runtime_ms);
 	__u64 best_start_ns = 0;
 	__u64 best_end_ns = 0;
 	size_t best = 0;
@@ -957,6 +982,8 @@ static int build_erf_schedule(const struct parsed_input *input,
 
 	for (i = 0; i < input->nr_tasks; i++) {
 		__u64 boundary_ns = deadline_ns;
+		__u64 raw_window_ns;
+		__u64 usable_window_ns;
 		int ret;
 
 		if (i + 1 < input->nr_tasks && plans[i + 1].cpu == plans[i].cpu)
@@ -970,7 +997,9 @@ static int build_erf_schedule(const struct parsed_input *input,
 			return -ERANGE;
 		}
 
-		ret = choose_task_frequency(&plans[i], boundary_ns - plans[i].start_ns);
+		raw_window_ns = boundary_ns - plans[i].start_ns;
+		usable_window_ns = apply_schedule_slack(raw_window_ns);
+		ret = choose_task_frequency(&plans[i], usable_window_ns);
 		if (ret < 0) {
 			fprintf(stderr,
 				"Cannot choose DVFS step for task%u on CPU%u\n",
@@ -1006,6 +1035,8 @@ static void print_schedule_summary(const struct erf_task_plan *plans,
 
 	printf("Loaded ERF schedule for %u tasks, deadline %.3f ms\n",
 	       control->nr_tasks, (double)control->deadline_ns / 1000000.0);
+	printf("Per-task slack reserve: %u%% of each scheduling window\n",
+	       ERF_SLACK_PCT);
 
 	for (i = 0; i < nr_plans; i++) {
 		const struct erf_task_plan *plan = &sorted[i];
