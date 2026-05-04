@@ -4,7 +4,7 @@
 #define SCHEDULER_MAX_TASKS 1024
 #define SCHEDULER_TASK_COMM_LEN 16
 
-struct scheduler_task_plan {
+struct schedule_task_plan {
 	__u32 task_id;
 	__u32 runtime_ms;
 	__u32 ready_ms;
@@ -17,7 +17,7 @@ struct scheduler_task_plan {
 	__u64 duration_ns;
 };
 
-struct scheduler_schedule_control {
+struct schedule_control {
 	__u64 deadline_ns;
 	__u32 nr_tasks;
 	__u32 reserved;

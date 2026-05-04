@@ -19,14 +19,14 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, SCHEDULER_MAX_TASKS);
 	__type(key, __u32);
-	__type(value, struct scheduler_task_plan);
+	__type(value, struct schedule_task_plan);
 } task_plans SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct scheduler_schedule_control);
+	__type(value, struct schedule_control);
 } schedule_control SEC(".maps");
 
 static inline bool is_dec(char c)
@@ -71,10 +71,10 @@ static inline bool parse_sched_task_name(const char *name,
 }
 
 static inline bool lookup_task_plan(const struct task_struct *p,
-				    struct scheduler_task_plan *plan)
+				    struct schedule_task_plan *plan)
 {
 	struct scheduler_task_name task_name;
-	struct scheduler_task_plan *map_plan;
+	struct schedule_task_plan *map_plan;
 
 	if (!parse_sched_task_name(p->comm, &task_name))
 		return false;
@@ -149,7 +149,7 @@ static inline void set_cpuperf_target(s32 cpu, u32 perf_target)
 s32 BPF_STRUCT_OPS(scheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	struct scheduler_task_plan plan;
+	struct schedule_task_plan plan;
 	bool is_idle = false;
 	s32 cpu;
 
@@ -172,7 +172,7 @@ s32 BPF_STRUCT_OPS(scheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct scheduler_task_plan plan;
+	struct schedule_task_plan plan;
 	s32 cpu;
 
 	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
@@ -201,7 +201,7 @@ void BPF_STRUCT_OPS(scheduler_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 {
-	struct scheduler_task_plan plan;
+	struct schedule_task_plan plan;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu))
