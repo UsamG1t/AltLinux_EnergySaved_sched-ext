@@ -15,8 +15,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "scx_sheduler.bpf.skel.h"
-#include "scx_sheduler_sched.h"
+#include "scx_scheduler.bpf.skel.h"
+#include "scx_scheduler_sched.h"
 
 #define ISOLATED_START 6
 #define ISOLATED_END 9
@@ -24,8 +24,9 @@
 #define MAX_TIME_IN_STATE_STEPS 64
 #define MAX_FREQ_KHZ 1800000U
 #define MIN_FREQ_KHZ 400000U
+#define ERF_SLACK_PCT 0U
 
-#define LOG_DIR "/tmp/scx_sheduler"
+#define LOG_DIR "/tmp/scx_scheduler"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
@@ -53,7 +54,7 @@ struct freq_step {
 struct task_input {
 	__u32 task_id;
 	__u32 runtime_ms;
-	char comm[SHEDULER_TASK_COMM_LEN];
+	__u32 ready_ms;
 };
 
 struct parsed_input {
@@ -66,10 +67,7 @@ struct parsed_input {
 struct cpu_plan_state {
 	__u32 cpu;
 	__u64 load_ms;
-	__u32 freq_step_idx;
-	__u32 freq_khz;
-	__u32 perf_target;
-	__u64 current_end_ns;
+	__u64 avail_ns;
 	__u32 next_order;
 };
 
@@ -561,8 +559,10 @@ static int parse_task_token(const char *token, struct task_input *task)
 {
 	const char *p = token;
 	char *endp;
+	char short_name[SCHEDULER_TASK_COMM_LEN];
 	unsigned long id;
 	unsigned long runtime_ms;
+	unsigned long ready_ms;
 	int len;
 
 	if (strncmp(p, "task", 4))
@@ -583,15 +583,25 @@ static int parse_task_token(const char *token, struct task_input *task)
 
 	errno = 0;
 	runtime_ms = strtoul(p, &endp, 10);
+	if (errno || endp == p || *endp != '@')
+		return -EINVAL;
+	p = endp + 1;
+
+	if (!is_dec_char(*p))
+		return -EINVAL;
+
+	errno = 0;
+	ready_ms = strtoul(p, &endp, 10);
 	if (errno || endp == p || *endp != '\0')
 		return -EINVAL;
 
 	task->task_id = (__u32)id;
 	task->runtime_ms = (__u32)runtime_ms;
+	task->ready_ms = (__u32)ready_ms;
 
-	len = snprintf(task->comm, sizeof(task->comm), "task%u_%u", task->task_id,
-		       task->runtime_ms);
-	if (len < 0 || len >= (int)sizeof(task->comm))
+	len = snprintf(short_name, sizeof(short_name), "task%u",
+		       task->task_id);
+	if (len < 0 || len >= SCHEDULER_TASK_COMM_LEN)
 		return -ENAMETOOLONG;
 
 	return 0;
@@ -601,7 +611,7 @@ static int add_input_task(struct parsed_input *input, const struct task_input *t
 {
 	struct task_input *new_tasks;
 
-	if (input->nr_tasks >= SHEDULER_MAX_TASKS)
+	if (input->nr_tasks >= SCHEDULER_MAX_TASKS)
 		return -E2BIG;
 
 	if (input->nr_tasks == input->cap_tasks) {
@@ -719,11 +729,15 @@ static int compare_task_id(const void *a, const void *b)
 	return 0;
 }
 
-static int compare_task_runtime_desc(const void *a, const void *b)
+static int compare_task_erf_order(const void *a, const void *b)
 {
 	const struct task_input *ta = a;
 	const struct task_input *tb = b;
 
+	if (ta->ready_ms < tb->ready_ms)
+		return -1;
+	if (ta->ready_ms > tb->ready_ms)
+		return 1;
 	if (ta->runtime_ms > tb->runtime_ms)
 		return -1;
 	if (ta->runtime_ms < tb->runtime_ms)
@@ -737,8 +751,8 @@ static int compare_task_runtime_desc(const void *a, const void *b)
 
 static int compare_plan_cpu_order(const void *a, const void *b)
 {
-	const struct sheduler_task_plan *pa = a;
-	const struct sheduler_task_plan *pb = b;
+	const struct scheduler_task_plan *pa = a;
+	const struct scheduler_task_plan *pb = b;
 
 	if (pa->cpu < pb->cpu)
 		return -1;
@@ -763,6 +777,21 @@ static int validate_input_tasks(struct parsed_input *input)
 				input->tasks[i].task_id);
 			return -EINVAL;
 		}
+		if (input->tasks[i].ready_ms >= input->deadline_ms) {
+			fprintf(stderr,
+				"task%u ready time %u ms is not earlier than deadline %llu ms\n",
+				input->tasks[i].task_id, input->tasks[i].ready_ms,
+				(unsigned long long)input->deadline_ms);
+			return -EINVAL;
+		}
+		if ((__u64)input->tasks[i].ready_ms +
+			    (__u64)input->tasks[i].runtime_ms >
+		    input->deadline_ms) {
+			fprintf(stderr,
+				"task%u cannot finish by deadline even at max frequency\n",
+				input->tasks[i].task_id);
+			return -ERANGE;
+		}
 		if (i > 0 && input->tasks[i - 1].task_id == input->tasks[i].task_id) {
 			fprintf(stderr, "duplicate task id %u\n",
 				input->tasks[i].task_id);
@@ -784,6 +813,30 @@ static __u64 task_duration_ns(__u32 runtime_ms, __u32 freq_khz)
 			    freq_khz);
 }
 
+static __u64 padded_slot_ns(__u32 runtime_ms)
+{
+	__u64 base_duration_ns = (__u64)runtime_ms * 1000000ULL;
+
+	if (!ERF_SLACK_PCT)
+		return base_duration_ns;
+
+	return ceil_div_u64(base_duration_ns * 100ULL, 100ULL - ERF_SLACK_PCT);
+}
+
+static __u64 apply_schedule_slack(__u64 window_ns)
+{
+	__u64 reserve_ns;
+
+	if (!window_ns || !ERF_SLACK_PCT)
+		return window_ns;
+
+	reserve_ns = ceil_div_u64(window_ns * ERF_SLACK_PCT, 100);
+	if (reserve_ns >= window_ns)
+		return 1;
+
+	return window_ns - reserve_ns;
+}
+
 static const struct freq_step *find_step_for_required_khz(__u32 required_khz)
 {
 	size_t i;
@@ -799,86 +852,89 @@ static const struct freq_step *find_step_for_required_khz(__u32 required_khz)
 	return NULL;
 }
 
-static size_t choose_least_loaded_cpu(const struct cpu_plan_state *cpus)
+static size_t choose_earliest_finish_cpu(const struct cpu_plan_state *cpus,
+					 const struct task_input *task,
+					 __u64 *start_ns_out,
+					 __u64 *end_ns_out)
 {
+	__u64 ready_ns = (__u64)task->ready_ms * 1000000ULL;
+	__u64 base_duration_ns = padded_slot_ns(task->runtime_ms);
+	__u64 best_start_ns = 0;
+	__u64 best_end_ns = 0;
 	size_t best = 0;
 	size_t i;
 
-	for (i = 1; i < NR_ISOLATED_CPUS; i++) {
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		__u64 start_ns = cpus[i].avail_ns > ready_ns ? cpus[i].avail_ns : ready_ns;
+		__u64 end_ns = start_ns + base_duration_ns;
+
+		if (!i || end_ns < best_end_ns) {
+			best = i;
+			best_start_ns = start_ns;
+			best_end_ns = end_ns;
+			continue;
+		}
+		if (end_ns > best_end_ns)
+			continue;
 		if (cpus[i].load_ms < cpus[best].load_ms) {
 			best = i;
+			best_start_ns = start_ns;
+			best_end_ns = end_ns;
 			continue;
 		}
 		if (cpus[i].load_ms == cpus[best].load_ms &&
-		    cpus[i].cpu < cpus[best].cpu)
+		    cpus[i].cpu < cpus[best].cpu) {
 			best = i;
+			best_start_ns = start_ns;
+			best_end_ns = end_ns;
+		}
 	}
 
+	*start_ns_out = best_start_ns;
+	*end_ns_out = best_end_ns;
 	return best;
 }
 
-static int choose_cpu_frequency(const struct sheduler_task_plan *plans,
-				size_t nr_plans, struct cpu_plan_state *cpu,
-				__u64 deadline_ms)
+static int choose_task_frequency(struct scheduler_task_plan *plan, __u64 window_ns)
 {
-	const struct freq_step *step;
-	size_t step_idx;
+	const struct freq_step *initial_step;
+	size_t i;
 
-	if (!cpu->load_ms) {
-		step = &freq_steps[0];
-		cpu->freq_step_idx = step->step_idx;
-		cpu->freq_khz = step->freq_khz;
-		cpu->perf_target = step->perf_target;
+	if (!window_ns)
+		return -ERANGE;
+
+	initial_step = find_step_for_required_khz((__u32)ceil_div_u64(
+		(__u64)plan->runtime_ms * MAX_FREQ_KHZ * 1000000ULL, window_ns));
+	if (!initial_step)
+		return -ERANGE;
+
+	for (i = initial_step->step_idx - 1;
+	     i < sizeof(freq_steps) / sizeof(freq_steps[0]); i++) {
+		__u64 duration_ns =
+			task_duration_ns(plan->runtime_ms, freq_steps[i].freq_khz);
+
+		if (duration_ns > window_ns)
+			continue;
+
+		plan->freq_step_idx = freq_steps[i].step_idx;
+		plan->freq_khz = freq_steps[i].freq_khz;
+		plan->perf_target = freq_steps[i].perf_target;
+		plan->duration_ns = duration_ns;
 		return 0;
 	}
 
-	if (cpu->load_ms > deadline_ms) {
-		fprintf(stderr,
-			"CPU %u load %llu ms exceeds deadline %llu ms even at max frequency\n",
-			cpu->cpu, (unsigned long long)cpu->load_ms,
-			(unsigned long long)deadline_ms);
-		return -ERANGE;
-	}
-
-	step = find_step_for_required_khz((__u32)ceil_div_u64(
-		cpu->load_ms * (__u64)MAX_FREQ_KHZ, deadline_ms));
-	if (!step)
-		return -ERANGE;
-
-	for (step_idx = step->step_idx - 1;
-	     step_idx < sizeof(freq_steps) / sizeof(freq_steps[0]); step_idx++) {
-		__u64 total_ns = 0;
-		size_t i;
-
-		for (i = 0; i < nr_plans; i++) {
-			if (plans[i].cpu != cpu->cpu)
-				continue;
-			total_ns += task_duration_ns(plans[i].runtime_ms,
-						    freq_steps[step_idx].freq_khz);
-		}
-
-		if (total_ns <= deadline_ms * 1000000ULL) {
-			cpu->freq_step_idx = freq_steps[step_idx].step_idx;
-			cpu->freq_khz = freq_steps[step_idx].freq_khz;
-			cpu->perf_target = freq_steps[step_idx].perf_target;
-			return 0;
-		}
-	}
-
-	fprintf(stderr, "CPU %u cannot fit into deadline after step rounding\n",
-		cpu->cpu);
 	return -ERANGE;
 }
 
-static int build_ltf_schedule(const struct parsed_input *input,
-			      struct sheduler_task_plan **plans_out,
-			      struct sheduler_schedule_control *control)
+static int build_erf_schedule(const struct parsed_input *input,
+			      struct scheduler_task_plan **plans_out,
+			      struct scheduler_schedule_control *control)
 {
 	struct task_input *sorted_tasks;
-	struct sheduler_task_plan *plans;
+	struct scheduler_task_plan *plans;
 	struct cpu_plan_state cpus[NR_ISOLATED_CPUS] = {};
+	__u64 deadline_ns = input->deadline_ms * 1000000ULL;
 	size_t i;
-	int ret;
 
 	sorted_tasks = malloc(input->nr_tasks * sizeof(*sorted_tasks));
 	plans = calloc(input->nr_tasks, sizeof(*plans));
@@ -890,46 +946,72 @@ static int build_ltf_schedule(const struct parsed_input *input,
 
 	memcpy(sorted_tasks, input->tasks, input->nr_tasks * sizeof(*sorted_tasks));
 	qsort(sorted_tasks, input->nr_tasks, sizeof(*sorted_tasks),
-	      compare_task_runtime_desc);
+	      compare_task_erf_order);
 
 	for (i = 0; i < NR_ISOLATED_CPUS; i++)
 		cpus[i].cpu = isolated_cpus[i];
 
 	for (i = 0; i < input->nr_tasks; i++) {
-		size_t cpu_idx = choose_least_loaded_cpu(cpus);
+		__u64 start_ns;
+		__u64 end_ns;
+		size_t cpu_idx =
+			choose_earliest_finish_cpu(cpus, &sorted_tasks[i], &start_ns,
+						 &end_ns);
+
+		if (end_ns > deadline_ns) {
+			fprintf(stderr,
+				"ERF base assignment cannot finish task%u by deadline\n",
+				sorted_tasks[i].task_id);
+			free(sorted_tasks);
+			free(plans);
+			return -ERANGE;
+		}
 
 		plans[i].task_id = sorted_tasks[i].task_id;
 		plans[i].runtime_ms = sorted_tasks[i].runtime_ms;
+		plans[i].ready_ms = sorted_tasks[i].ready_ms;
 		plans[i].cpu = cpus[cpu_idx].cpu;
+		plans[i].order = cpus[cpu_idx].next_order++;
+		plans[i].start_ns = start_ns;
+
+		cpus[cpu_idx].avail_ns = end_ns;
 		cpus[cpu_idx].load_ms += sorted_tasks[i].runtime_ms;
 	}
 
-	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		ret = choose_cpu_frequency(plans, input->nr_tasks, &cpus[i],
-					   input->deadline_ms);
+	qsort(plans, input->nr_tasks, sizeof(*plans), compare_plan_cpu_order);
+
+	for (i = 0; i < input->nr_tasks; i++) {
+		__u64 boundary_ns = deadline_ns;
+		__u64 raw_window_ns;
+		__u64 usable_window_ns;
+		int ret;
+
+		if (i + 1 < input->nr_tasks && plans[i + 1].cpu == plans[i].cpu)
+			boundary_ns = plans[i + 1].start_ns;
+		if (boundary_ns <= plans[i].start_ns) {
+			fprintf(stderr,
+				"Invalid ERF window for task%u on CPU%u\n",
+				plans[i].task_id, plans[i].cpu);
+			free(sorted_tasks);
+			free(plans);
+			return -ERANGE;
+		}
+
+		raw_window_ns = boundary_ns - plans[i].start_ns;
+		usable_window_ns = apply_schedule_slack(raw_window_ns);
+		ret = choose_task_frequency(&plans[i], usable_window_ns);
 		if (ret < 0) {
+			fprintf(stderr,
+				"Cannot choose DVFS step for task%u on CPU%u\n",
+				plans[i].task_id, plans[i].cpu);
 			free(sorted_tasks);
 			free(plans);
 			return ret;
 		}
 	}
 
-	for (i = 0; i < input->nr_tasks; i++) {
-		size_t cpu_idx = plans[i].cpu - ISOLATED_START;
-		struct cpu_plan_state *cpu = &cpus[cpu_idx];
-
-		plans[i].freq_step_idx = cpu->freq_step_idx;
-		plans[i].freq_khz = cpu->freq_khz;
-		plans[i].perf_target = cpu->perf_target;
-		plans[i].order = cpu->next_order++;
-		plans[i].start_ns = cpu->current_end_ns;
-		plans[i].duration_ns =
-			task_duration_ns(plans[i].runtime_ms, cpu->freq_khz);
-		cpu->current_end_ns += plans[i].duration_ns;
-	}
-
 	memset(control, 0, sizeof(*control));
-	control->deadline_ns = input->deadline_ms * 1000000ULL;
+	control->deadline_ns = deadline_ns;
 	control->nr_tasks = input->nr_tasks;
 
 	free(sorted_tasks);
@@ -937,11 +1019,11 @@ static int build_ltf_schedule(const struct parsed_input *input,
 	return 0;
 }
 
-static void print_schedule_summary(const struct sheduler_task_plan *plans,
+static void print_schedule_summary(const struct scheduler_task_plan *plans,
 				   size_t nr_plans,
-				   const struct sheduler_schedule_control *control)
+				   const struct scheduler_schedule_control *control)
 {
-	struct sheduler_task_plan *sorted;
+	struct scheduler_task_plan *sorted;
 	size_t i;
 
 	sorted = malloc(nr_plans * sizeof(*sorted));
@@ -951,29 +1033,30 @@ static void print_schedule_summary(const struct sheduler_task_plan *plans,
 	memcpy(sorted, plans, nr_plans * sizeof(*sorted));
 	qsort(sorted, nr_plans, sizeof(*sorted), compare_plan_cpu_order);
 
-	printf("Loaded LTF schedule for %u tasks, deadline %.3f ms\n",
+	printf("Loaded ERF schedule for %u tasks, deadline %.3f ms\n",
 	       control->nr_tasks, (double)control->deadline_ns / 1000000.0);
+	printf("Per-task slack reserve: %u%% of each scheduling window\n",
+	       ERF_SLACK_PCT);
 
 	for (i = 0; i < nr_plans; i++) {
-		const struct sheduler_task_plan *plan = &sorted[i];
+		const struct scheduler_task_plan *plan = &sorted[i];
 
-		if (i == 0 || sorted[i - 1].cpu != plan->cpu) {
-			printf("CPU%u freq=%u kHz step=%u\n", plan->cpu,
-			       plan->freq_khz, plan->freq_step_idx);
-		}
+		if (i == 0 || sorted[i - 1].cpu != plan->cpu)
+			printf("CPU%u\n", plan->cpu);
 
-		printf("  order=%u task%u_%u start=%.3fms duration=%.3fms\n",
+		printf("  order=%u task%u runtime=%u ready=%.3fms start=%.3fms duration=%.3fms step=%u freq=%u\n",
 		       plan->order, plan->task_id, plan->runtime_ms,
-		       (double)plan->start_ns / 1000000.0,
-		       (double)plan->duration_ns / 1000000.0);
+		       (double)plan->ready_ms, (double)plan->start_ns / 1000000.0,
+		       (double)plan->duration_ns / 1000000.0, plan->freq_step_idx,
+		       plan->freq_khz);
 	}
 
 	free(sorted);
 }
 
-static int load_schedule_maps(struct scx_sheduler *skel,
-			      const struct sheduler_schedule_control *control,
-			      const struct sheduler_task_plan *plans,
+static int load_schedule_maps(struct scx_scheduler *skel,
+			      const struct scheduler_schedule_control *control,
+			      const struct scheduler_task_plan *plans,
 			      size_t nr_plans)
 {
 	int task_plans_fd;
@@ -997,20 +1080,20 @@ static int load_schedule_maps(struct scx_sheduler *skel,
 	return 0;
 }
 
-static void free_plans(struct sheduler_task_plan *plans)
+static void free_plans(struct scheduler_task_plan *plans)
 {
 	free(plans);
 }
 
 int main(int argc, char **argv)
 {
-	struct scx_sheduler *skel = NULL;
+	struct scx_scheduler *skel = NULL;
 	struct bpf_link *link = NULL;
 	struct cpu_tis_reader tis_readers[NR_ISOLATED_CPUS];
 	struct boost_state boost = {};
 	struct parsed_input input = {};
-	struct sheduler_task_plan *plans = NULL;
-	struct sheduler_schedule_control control = {};
+	struct scheduler_task_plan *plans = NULL;
+	struct scheduler_schedule_control control = {};
 	struct timespec start_ts;
 	FILE *csv = NULL;
 	double sample_interval_sec = 1.0;
@@ -1059,7 +1142,7 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		goto out;
 
-	ret = build_ltf_schedule(&input, &plans, &control);
+	ret = build_erf_schedule(&input, &plans, &control);
 	if (ret < 0)
 		goto out;
 
@@ -1068,14 +1151,14 @@ int main(int argc, char **argv)
 		goto out;
 
 restart:
-	skel = SCX_OPS_OPEN(sheduler_ops, scx_sheduler);
-	SCX_OPS_LOAD(skel, sheduler_ops, scx_sheduler, uei);
+	skel = SCX_OPS_OPEN(scheduler_ops, scx_scheduler);
+	SCX_OPS_LOAD(skel, scheduler_ops, scx_scheduler, uei);
 
 	ret = load_schedule_maps(skel, &control, plans, input.nr_tasks);
 	if (ret < 0)
 		goto out;
 
-	link = SCX_OPS_ATTACH(skel, sheduler_ops, scx_sheduler);
+	link = SCX_OPS_ATTACH(skel, scheduler_ops, scx_scheduler);
 
 	ret = ensure_log_dir();
 	if (ret < 0)
@@ -1148,7 +1231,7 @@ out:
 
 	ecode = skel ? UEI_REPORT(skel, uei) : 0;
 	if (skel)
-		scx_sheduler__destroy(skel);
+		scx_scheduler__destroy(skel);
 
 	if (!ret && UEI_ECODE_RESTART(ecode)) {
 		init_tis_readers(tis_readers);

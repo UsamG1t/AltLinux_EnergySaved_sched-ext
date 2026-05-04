@@ -1,6 +1,6 @@
 #include <scx/common.bpf.h>
 
-#include "scx_sheduler_sched.h"
+#include "scx_scheduler_sched.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -11,23 +11,22 @@ UEI_DEFINE(uei);
 #define ISOLATED_END 9
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
 
-struct sheduler_task_name {
+struct scheduler_task_name {
 	u32 task_id;
-	u32 runtime_ms;
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, SHEDULER_MAX_TASKS);
+	__uint(max_entries, SCHEDULER_MAX_TASKS);
 	__type(key, __u32);
-	__type(value, struct sheduler_task_plan);
+	__type(value, struct scheduler_task_plan);
 } task_plans SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct sheduler_schedule_control);
+	__type(value, struct scheduler_schedule_control);
 } schedule_control SEC(".maps");
 
 static inline bool is_dec(char c)
@@ -41,13 +40,10 @@ static inline bool is_isolated_cpu(s32 cpu)
 }
 
 static inline bool parse_sched_task_name(const char *name,
-					 struct sheduler_task_name *task_name)
+					 struct scheduler_task_name *task_name)
 {
 	u32 task_id = 0;
-	u32 runtime_ms = 0;
 	bool seen_id = false;
-	bool seen_runtime = false;
-	bool parsing_runtime = false;
 	int i;
 
 	if (name[0] != 't' || name[1] != 'a' || name[2] != 's' ||
@@ -55,53 +51,36 @@ static inline bool parse_sched_task_name(const char *name,
 		return false;
 
 	#pragma unroll
-	for (i = 4; i < SHEDULER_TASK_COMM_LEN; i++) {
+	for (i = 4; i < SCHEDULER_TASK_COMM_LEN; i++) {
 		char c = name[i];
 
-		if (!parsing_runtime) {
-			if (c == '_') {
-				if (!seen_id)
-					return false;
-				parsing_runtime = true;
-				continue;
-			}
-			if (!is_dec(c))
-				return false;
-			seen_id = true;
-			task_id = task_id * 10 + (c - '0');
-			continue;
-		}
-
 		if (c == '\0') {
-			if (!seen_runtime)
+			if (!seen_id)
 				return false;
 			task_name->task_id = task_id;
-			task_name->runtime_ms = runtime_ms;
 			return true;
 		}
 
 		if (!is_dec(c))
 			return false;
-		seen_runtime = true;
-		runtime_ms = runtime_ms * 10 + (c - '0');
+		seen_id = true;
+		task_id = task_id * 10 + (c - '0');
 	}
 
 	return false;
 }
 
 static inline bool lookup_task_plan(const struct task_struct *p,
-				    struct sheduler_task_plan *plan)
+				    struct scheduler_task_plan *plan)
 {
-	struct sheduler_task_name task_name;
-	struct sheduler_task_plan *map_plan;
+	struct scheduler_task_name task_name;
+	struct scheduler_task_plan *map_plan;
 
 	if (!parse_sched_task_name(p->comm, &task_name))
 		return false;
 
 	map_plan = bpf_map_lookup_elem(&task_plans, &task_name.task_id);
 	if (!map_plan)
-		return false;
-	if (map_plan->runtime_ms != task_name.runtime_ms)
 		return false;
 
 	*plan = *map_plan;
@@ -167,10 +146,10 @@ static inline void set_cpuperf_target(s32 cpu, u32 perf_target)
 	scx_bpf_cpuperf_set(cpu, perf_target);
 }
 
-s32 BPF_STRUCT_OPS(sheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
+s32 BPF_STRUCT_OPS(scheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	struct sheduler_task_plan plan;
+	struct scheduler_task_plan plan;
 	bool is_idle = false;
 	s32 cpu;
 
@@ -191,9 +170,9 @@ s32 BPF_STRUCT_OPS(sheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 	return cpu;
 }
 
-void BPF_STRUCT_OPS(sheduler_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	struct sheduler_task_plan plan;
+	struct scheduler_task_plan plan;
 	s32 cpu;
 
 	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
@@ -214,15 +193,15 @@ void BPF_STRUCT_OPS(sheduler_enqueue, struct task_struct *p, u64 enq_flags)
 	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 }
 
-void BPF_STRUCT_OPS(sheduler_dispatch, s32 cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(scheduler_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (!is_isolated_cpu(cpu))
 		scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
-void BPF_STRUCT_OPS(sheduler_running, struct task_struct *p)
+void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 {
-	struct sheduler_task_plan plan;
+	struct scheduler_task_plan plan;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu))
@@ -236,7 +215,7 @@ void BPF_STRUCT_OPS(sheduler_running, struct task_struct *p)
 	set_cpuperf_target(cpu, 0);
 }
 
-void BPF_STRUCT_OPS(sheduler_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(scheduler_stopping, struct task_struct *p, bool runnable)
 {
 	s32 cpu = scx_bpf_task_cpu(p);
 
@@ -246,7 +225,7 @@ void BPF_STRUCT_OPS(sheduler_stopping, struct task_struct *p, bool runnable)
 	set_cpuperf_target(cpu, 0);
 }
 
-void BPF_STRUCT_OPS(sheduler_update_idle, s32 cpu, bool idle)
+void BPF_STRUCT_OPS(scheduler_update_idle, s32 cpu, bool idle)
 {
 	if (!idle || !is_isolated_cpu(cpu))
 		return;
@@ -254,7 +233,7 @@ void BPF_STRUCT_OPS(sheduler_update_idle, s32 cpu, bool idle)
 	set_cpuperf_target(cpu, 0);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(sheduler_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(scheduler_init)
 {
 	const struct cpumask *online = scx_bpf_get_online_cpumask();
 	int i;
@@ -271,19 +250,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(sheduler_init)
 	return scx_bpf_create_dsq(SHARED_DSQ, -1);
 }
 
-void BPF_STRUCT_OPS(sheduler_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(scheduler_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(sheduler_ops,
-	       .select_cpu		= (void *)sheduler_select_cpu,
-	       .enqueue			= (void *)sheduler_enqueue,
-	       .dispatch		= (void *)sheduler_dispatch,
-	       .running			= (void *)sheduler_running,
-	       .stopping		= (void *)sheduler_stopping,
-	       .update_idle		= (void *)sheduler_update_idle,
-	       .init			= (void *)sheduler_init,
-	       .exit			= (void *)sheduler_exit,
+SCX_OPS_DEFINE(scheduler_ops,
+	       .select_cpu		= (void *)scheduler_select_cpu,
+	       .enqueue			= (void *)scheduler_enqueue,
+	       .dispatch		= (void *)scheduler_dispatch,
+	       .running			= (void *)scheduler_running,
+	       .stopping		= (void *)scheduler_stopping,
+	       .update_idle		= (void *)scheduler_update_idle,
+	       .init			= (void *)scheduler_init,
+	       .exit			= (void *)scheduler_exit,
 	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,
-	       .name			= "sheduler");
+	       .name			= "scheduler");

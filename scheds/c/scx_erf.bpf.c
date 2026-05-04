@@ -265,4 +265,4 @@ SCX_OPS_DEFINE(erf_ops,
 	       .init			= (void *)erf_init,
 	       .exit			= (void *)erf_exit,
 	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,
-	       .name			= "sheduler");
+	       .name			= "erf");
