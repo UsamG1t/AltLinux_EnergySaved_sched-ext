@@ -7,12 +7,17 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 #define SHARED_DSQ 0
+#define WAIT_DSQ_BASE 0x1000
 #define ISOLATED_START 6
 #define ISOLATED_END 9
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
 
 struct scheduler_task_name {
 	u32 task_id;
+};
+
+struct schedule_runtime_state {
+	u64 base_ns;
 };
 
 struct {
@@ -28,6 +33,13 @@ struct {
 	__type(key, __u32);
 	__type(value, struct schedule_control);
 } schedule_control SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct schedule_runtime_state);
+} schedule_runtime SEC(".maps");
 
 static inline bool is_dec(char c)
 {
@@ -146,6 +158,88 @@ static inline void set_cpuperf_target(s32 cpu, u32 perf_target)
 	scx_bpf_cpuperf_set(cpu, perf_target);
 }
 
+static inline u64 wait_dsq_id_for_cpu(s32 cpu)
+{
+	return WAIT_DSQ_BASE + (u64)(cpu - ISOLATED_START);
+}
+
+static inline u64 task_ready_ns(const struct schedule_task_plan *plan)
+{
+	return (u64)plan->ready_ms * 1000000ULL;
+}
+
+static inline u64 get_or_init_schedule_base_ns(const struct schedule_task_plan *plan,
+					       u64 now)
+{
+	struct schedule_runtime_state *state;
+	u64 candidate;
+	u64 prev;
+	u32 key = 0;
+
+	state = bpf_map_lookup_elem(&schedule_runtime, &key);
+	if (!state)
+		return 0;
+
+	if (state->base_ns)
+		return state->base_ns;
+
+	candidate = now;
+	if (candidate >= task_ready_ns(plan))
+		candidate -= task_ready_ns(plan);
+
+	prev = __sync_val_compare_and_swap(&state->base_ns, 0, candidate);
+	return prev ? prev : candidate;
+}
+
+static inline u64 task_abs_start_ns(const struct schedule_task_plan *plan, u64 base_ns)
+{
+	return base_ns + plan->start_ns;
+}
+
+static inline bool task_start_reached(const struct schedule_task_plan *plan, u64 now)
+{
+	u64 base_ns = get_or_init_schedule_base_ns(plan, now);
+
+	return now >= task_abs_start_ns(plan, base_ns);
+}
+
+static inline void enqueue_planned_task(struct task_struct *p,
+					 const struct schedule_task_plan *plan,
+					 u64 enq_flags)
+{
+	u64 now = scx_bpf_now();
+
+	if (task_start_reached(plan, now)) {
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | plan->cpu, SCX_SLICE_DFL,
+				   enq_flags);
+		return;
+	}
+
+	scx_bpf_dsq_insert_vtime(p, wait_dsq_id_for_cpu(plan->cpu), SCX_SLICE_DFL,
+				 task_abs_start_ns(plan, get_or_init_schedule_base_ns(plan, now)),
+				 enq_flags);
+	scx_bpf_kick_cpu(plan->cpu, 0);
+}
+
+static inline void dispatch_waiting_task(s32 cpu)
+{
+	struct task_struct *p;
+	struct schedule_task_plan plan;
+	u64 now;
+
+	p = __COMPAT_scx_bpf_dsq_peek(wait_dsq_id_for_cpu(cpu));
+	if (!p)
+		return;
+	if (!lookup_task_plan(p, &plan))
+		return;
+
+	now = scx_bpf_now();
+	if (!task_start_reached(&plan, now))
+		return;
+
+	scx_bpf_dsq_move_to_local(wait_dsq_id_for_cpu(cpu));
+}
+
 s32 BPF_STRUCT_OPS(scheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -176,8 +270,7 @@ void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 
 	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | plan.cpu, SCX_SLICE_DFL,
-				   enq_flags);
+		enqueue_planned_task(p, &plan, enq_flags);
 		return;
 	}
 
@@ -195,6 +288,11 @@ void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 
 void BPF_STRUCT_OPS(scheduler_dispatch, s32 cpu, struct task_struct *prev)
 {
+	if (is_isolated_cpu(cpu)) {
+		dispatch_waiting_task(cpu);
+		return;
+	}
+
 	if (!is_isolated_cpu(cpu))
 		scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
@@ -230,6 +328,7 @@ void BPF_STRUCT_OPS(scheduler_update_idle, s32 cpu, bool idle)
 	if (!idle || !is_isolated_cpu(cpu))
 		return;
 
+	dispatch_waiting_task(cpu);
 	set_cpuperf_target(cpu, 0);
 }
 
@@ -247,7 +346,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(scheduler_init)
 	}
 
 	scx_bpf_put_cpumask(online);
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (scx_bpf_create_dsq(SHARED_DSQ, -1))
+		return -EINVAL;
+
+	#pragma unroll
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		if (scx_bpf_create_dsq(wait_dsq_id_for_cpu(ISOLATED_START + i), -1))
+			return -EINVAL;
+	}
+
+	return 0;
 }
 
 void BPF_STRUCT_OPS(scheduler_exit, struct scx_exit_info *ei)
