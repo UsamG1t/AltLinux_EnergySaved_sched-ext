@@ -30,8 +30,16 @@
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
+enum cpu_freq_reader_mode {
+	CPU_FREQ_READER_NONE = 0,
+	CPU_FREQ_READER_TIME_IN_STATE,
+	CPU_FREQ_READER_CPUINFO_AVG,
+	CPU_FREQ_READER_SCALING_CUR,
+};
+
 struct cpu_tis_reader {
 	int fd;
+	enum cpu_freq_reader_mode mode;
 	size_t nr_entries;
 	long freqs_khz[MAX_TIME_IN_STATE_STEPS];
 	unsigned long long prev_ticks[MAX_TIME_IN_STATE_STEPS];
@@ -114,6 +122,7 @@ static void init_tis_readers(struct cpu_tis_reader *readers)
 
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 		readers[i].fd = -1;
+		readers[i].mode = CPU_FREQ_READER_NONE;
 		readers[i].nr_entries = 0;
 		readers[i].have_prev = false;
 		readers[i].path[0] = '\0';
@@ -289,20 +298,67 @@ static void restore_boost(const struct boost_state *boost)
 			boost->original_value);
 }
 
-static int open_tis_reader(struct cpu_tis_reader *reader, int cpu)
+static const char *reader_mode_desc(enum cpu_freq_reader_mode mode)
+{
+	switch (mode) {
+	case CPU_FREQ_READER_TIME_IN_STATE:
+		return "time_in_state";
+	case CPU_FREQ_READER_CPUINFO_AVG:
+		return "cpuinfo_avg_freq";
+	case CPU_FREQ_READER_SCALING_CUR:
+		return "scaling_cur_freq";
+	default:
+		return "unknown";
+	}
+}
+
+static int try_open_reader_path(struct cpu_tis_reader *reader,
+				enum cpu_freq_reader_mode mode, int cpu,
+				const char *suffix)
 {
 	snprintf(reader->path, sizeof(reader->path),
-		 "/sys/devices/system/cpu/cpufreq/policy%d/stats/time_in_state",
-		 cpu);
+		 "/sys/devices/system/cpu/cpufreq/policy%d/%s", cpu, suffix);
 
 	reader->fd = open(reader->path, O_RDONLY | O_CLOEXEC);
 	reader->nr_entries = 0;
 	reader->have_prev = false;
-	if (reader->fd >= 0)
+	if (reader->fd >= 0) {
+		reader->mode = mode;
+		return 0;
+	}
+
+	return -errno;
+}
+
+static int open_tis_reader(struct cpu_tis_reader *reader, int cpu)
+{
+	int ret;
+
+	ret = try_open_reader_path(reader, CPU_FREQ_READER_TIME_IN_STATE, cpu,
+				   "stats/time_in_state");
+	if (!ret)
+		return 0;
+	if (ret != -ENOENT && ret != -ENOTDIR) {
+		fprintf(stderr, "Could not open %s\n", reader->path);
+		return ret;
+	}
+
+	ret = try_open_reader_path(reader, CPU_FREQ_READER_CPUINFO_AVG, cpu,
+				   "cpuinfo_avg_freq");
+	if (!ret)
+		return 0;
+	if (ret != -ENOENT && ret != -ENOTDIR) {
+		fprintf(stderr, "Could not open %s\n", reader->path);
+		return ret;
+	}
+
+	ret = try_open_reader_path(reader, CPU_FREQ_READER_SCALING_CUR, cpu,
+				   "scaling_cur_freq");
+	if (!ret)
 		return 0;
 
 	fprintf(stderr, "Could not open %s\n", reader->path);
-	return -errno;
+	return ret;
 }
 
 static void close_tis_readers(struct cpu_tis_reader *readers)
@@ -314,6 +370,7 @@ static void close_tis_readers(struct cpu_tis_reader *readers)
 			close(readers[i].fd);
 			readers[i].fd = -1;
 		}
+		readers[i].mode = CPU_FREQ_READER_NONE;
 	}
 }
 
@@ -393,6 +450,25 @@ static int sample_policy_freq_mhz(struct cpu_tis_reader *reader, bool *valid,
 	*valid = false;
 	if (reader->fd < 0)
 		return -ENOENT;
+
+	if (reader->mode != CPU_FREQ_READER_TIME_IN_STATE) {
+		long freq_khz;
+		char *endp;
+
+		nr_read = pread(reader->fd, buf, sizeof(buf) - 1, 0);
+		if (nr_read <= 0)
+			return nr_read ? -errno : -EIO;
+
+		buf[nr_read] = '\0';
+		errno = 0;
+		freq_khz = strtol(buf, &endp, 10);
+		if (errno || endp == buf)
+			return -EINVAL;
+
+		*valid = true;
+		*policy_mhz = (double)freq_khz / 1000.0;
+		return 0;
+	}
 
 	nr_read = pread(reader->fd, buf, sizeof(buf) - 1, 0);
 	if (nr_read <= 0)
@@ -1188,7 +1264,16 @@ restart:
 		       boost.original_value);
 	printf("Monitoring isolated CPUs 6-9 every %.3f s\n",
 	       sample_interval_sec);
-	printf("Sample format: policy MHz from time_in_state\n");
+	{
+		int i;
+
+		printf("Sample source per CPU:");
+		for (i = 0; i < NR_ISOLATED_CPUS; i++)
+			printf(" cpu%d=%s", isolated_cpus[i],
+			       reader_mode_desc(tis_readers[i].mode));
+		printf("\n");
+	}
+	printf("Sample format: MHz from configured source\n");
 	printf("Logging samples to %s\n", LOG_CSV_PATH);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
