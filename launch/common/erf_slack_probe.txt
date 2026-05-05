@@ -1,0 +1,17 @@
+# ERF slack verification workload
+# Purpose: compare with earlier dense runs where later tasks on CPU8/CPU9
+# started to overlap and cause frequency jumps.
+# Format: task<ID>_<runtime_ms>@<ready_ms>
+
+deadline=120000
+
+task1_35000@0
+task2_28000@0
+task3_22000@10000
+task4_18000@15000
+task5_26000@25000
+task6_12000@40000
+task7_30000@45000
+task8_15000@60000
+task9_10000@70000
+task10_8000@90000

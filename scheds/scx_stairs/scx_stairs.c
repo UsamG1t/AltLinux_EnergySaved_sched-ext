@@ -26,7 +26,7 @@
 #define STAIRS_COMM_LEN 16
 #define MAX_TIME_IN_STATE_STEPS 64
 
-#define LOG_DIR "/tmp/scx_stairs"
+#define LOG_DIR "results/scx_stairs"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define LOG_META_PATH LOG_DIR "/latest.meta"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"

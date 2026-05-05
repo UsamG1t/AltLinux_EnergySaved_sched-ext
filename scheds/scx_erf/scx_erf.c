@@ -26,7 +26,7 @@
 #define MIN_FREQ_KHZ 400000U
 #define ERF_SLACK_PCT 0U
 
-#define LOG_DIR "/tmp/scx_erf"
+#define LOG_DIR "results/scx_erf"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 

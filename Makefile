@@ -1,42 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
-#
-# Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
 
-# Always require out-of-source builds - default to O=build if not specified
-ifeq ("$(origin O)", "command line")
-  KBUILD_OUTPUT := $(abspath $(O))
-else
-  KBUILD_OUTPUT := $(CURDIR)/build
-endif
+ROOT_SRC_DIR := $(CURDIR)
 
-# Always redirect to out-of-tree build directory unless we're already there
-ifneq ($(KBUILD_OUTPUT), $(CURDIR))
-# Only redirect if ROOT_SRC_DIR is not set (i.e., we're not already redirected)
-ifeq ($(ROOT_SRC_DIR),)
-
-PHONY += _all $(MAKECMDGOALS) sub-make
-
-$(filter-out _all sub-make,$(MAKECMDGOALS)) _all: sub-make
-	@:
-
-sub-make:
-	@mkdir -p $(KBUILD_OUTPUT)
-	@$(MAKE) --no-print-directory -C $(KBUILD_OUTPUT) -f $(CURDIR)/Makefile \
-		ROOT_SRC_DIR=$(CURDIR) \
-		LIB_OBJ_DIR=$(KBUILD_OUTPUT)/lib SCHED_OBJ_DIR=$(KBUILD_OUTPUT)/scheds/c \
-		$(MAKECMDGOALS)
-
-.PHONY: $(PHONY)
-
-# Skip the rest of the makefile when redirecting
-skip-makefile := 1
-endif
-endif
-
-ifeq ($(skip-makefile),)
-
-export BPF_CLANG ?= clang
-export BPFTOOL ?= bpftool
+BPF_CLANG ?= clang
+BPFTOOL ?= bpftool
+CC ?= cc
+INSTALL_DIR ?= /usr/local/bin
 
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),x86_64)
@@ -54,60 +23,79 @@ ENDIAN ?= $(shell printf '\1\0' | od -An -t x2 | awk '{print ($$1=="0001"?"littl
 LIBBPF_CFLAGS := $(shell pkg-config --cflags libbpf)
 LIBBPF_LIBS := $(shell pkg-config --libs libbpf)
 
-export BPF_CFLAGS := -g -O2 -Wall -Wno-compare-distinct-pointer-types \
+BPF_CFLAGS := -g -O2 -Wall -Wno-compare-distinct-pointer-types \
 	-D__TARGET_ARCH_$(TARGET_ARCH) -mcpu=v3 -m$(ENDIAN)-endian
-
-# ROOT_SRC_DIR is set by the top-level make call for out-of-source builds
-export ROOT_SRC_DIR ?= $(CURDIR)
-export BPF_INCLUDES := -I$(ROOT_SRC_DIR)/scheds/include \
+BPF_INCLUDES := -I$(ROOT_SRC_DIR)/scheds/include \
 	-I$(ROOT_SRC_DIR)/scheds/include/bpf-compat \
 	-I$(ROOT_SRC_DIR)/scheds/include/lib \
 	-I$(ROOT_SRC_DIR)/scheds/vmlinux \
 	-I$(ROOT_SRC_DIR)/scheds/vmlinux/arch/$(TARGET_ARCH) \
 	$(LIBBPF_CFLAGS)
 
-export CFLAGS := -std=gnu11 -I$(ROOT_SRC_DIR)/scheds/include -I$(ROOT_SRC_DIR)/scheds/vmlinux -I$(SCHED_OBJ_DIR) $(LIBBPF_CFLAGS)
+LIBBPF_DEPS := $(LIBBPF_LIBS) -lelf -lz -lzstd
+THREAD_DEPS := -lpthread
 
-export LIBBPF_DEPS := $(LIBBPF_LIBS) -lelf -lz -lzstd
-export THREAD_DEPS := -lpthread
+LIB_OBJ_DIR := $(ROOT_SRC_DIR)/build/lib
+COMMON_OBJ_DIR := $(ROOT_SRC_DIR)/build/common
+COMMON_CFLAGS := -O2 -std=c11 -Wall -Wextra -pedantic
 
-export OBJ_DIR := $(CURDIR)
-ifeq ($(LIB_OBJ_DIR),)
-  export LIB_OBJ_DIR := $(ROOT_SRC_DIR)/lib
-endif
-ifeq ($(SCHED_OBJ_DIR),)
-  export SCHED_OBJ_DIR := $(ROOT_SRC_DIR)/scheds/c
-endif
+SCHEDULERS := scx_stairs scx_erf scx_scheduler
 
-# Scheduler lists for convenience targets
-C_SCHEDS := scx_erf scx_scheduler scx_stairs scx_isolfreq_dispatch scx_isolfreq_tick scx_data scx_dumb scx_range_naming scx_naming
-C_SCHEDS_LIB := scx_sdt
+.PHONY: all clean install lib common $(SCHEDULERS) task_workload_origin
 
-all: lib scheds-c
-
-# Individual scheduler targets
-$(C_SCHEDS) $(C_SCHEDS_LIB): lib
-	@mkdir -p $(SCHED_OBJ_DIR)
-	@$(MAKE) -C $(ROOT_SRC_DIR)/scheds/c SRC_DIR=$(ROOT_SRC_DIR)/scheds/c $@
-
-$(LIB_OBJ_DIR) $(SCHED_OBJ_DIR):
-	@mkdir -p $@
+all: lib common $(SCHEDULERS)
 
 lib:
 	@mkdir -p $(LIB_OBJ_DIR)
-	@$(MAKE) -C $(ROOT_SRC_DIR)/lib SRC_DIR=$(ROOT_SRC_DIR)/lib
+	@$(MAKE) -C $(ROOT_SRC_DIR)/lib \
+		SRC_DIR=$(ROOT_SRC_DIR)/lib \
+		LIB_OBJ_DIR=$(LIB_OBJ_DIR) \
+		BPF_CLANG="$(BPF_CLANG)" \
+		BPFTOOL="$(BPFTOOL)" \
+		BPF_CFLAGS="$(BPF_CFLAGS)" \
+		BPF_INCLUDES="$(BPF_INCLUDES)"
 
-scheds-c: lib
-	@mkdir -p $(SCHED_OBJ_DIR)
-	@$(MAKE) -C $(ROOT_SRC_DIR)/scheds/c SRC_DIR=$(ROOT_SRC_DIR)/scheds/c
+common: task_workload_origin
 
-clean:
-	$(MAKE) -C $(ROOT_SRC_DIR)/lib clean
-	$(MAKE) -C $(ROOT_SRC_DIR)/scheds/c clean
+task_workload_origin: $(COMMON_OBJ_DIR)/task_workload_origin
+
+$(COMMON_OBJ_DIR)/task_workload_origin: $(ROOT_SRC_DIR)/launch/common/task_workload_origin.c
+	@mkdir -p $(dir $@)
+	$(CC) $(COMMON_CFLAGS) $< -o $@
+
+define SCHED_RULES
+$(ROOT_SRC_DIR)/build/$(1)/$(1).bpf.o: $(ROOT_SRC_DIR)/scheds/$(1)/$(1).bpf.c
+	@echo "Compiling BPF: $$< -> $$@"
+	@mkdir -p $$(dir $$@)
+	$(BPF_CLANG) $(BPF_CFLAGS) -target bpf $(BPF_INCLUDES) -c $$< -o $$@
+
+$(ROOT_SRC_DIR)/build/$(1)/$(1).bpf.skel.h: $(ROOT_SRC_DIR)/build/$(1)/$(1).bpf.o
+	@echo "Generating skeleton: $$@"
+	@mkdir -p $$(dir $$@)
+	$(BPFTOOL) gen skeleton $$< name $(1) > $$@
+
+$(ROOT_SRC_DIR)/build/$(1)/$(1): $(ROOT_SRC_DIR)/scheds/$(1)/$(1).c $(ROOT_SRC_DIR)/build/$(1)/$(1).bpf.skel.h
+	@echo "Building scheduler: $$@"
+	@mkdir -p $$(dir $$@)
+	$(CC) -std=gnu11 -I$(ROOT_SRC_DIR)/scheds/include -I$(ROOT_SRC_DIR)/scheds/vmlinux -I$(ROOT_SRC_DIR)/build/$(1) -I$(ROOT_SRC_DIR)/scheds/$(1) $(LIBBPF_CFLAGS) $$< -o $$@ $(LIBBPF_DEPS) $(THREAD_DEPS)
+
+$(1): lib $(ROOT_SRC_DIR)/build/$(1)/$(1)
+endef
+
+$(foreach sched,$(SCHEDULERS),$(eval $(call SCHED_RULES,$(sched))))
 
 install: all
-	$(MAKE) -C $(ROOT_SRC_DIR)/scheds/c install
+	@mkdir -p $(INSTALL_DIR)
+	@for sched in $(SCHEDULERS); do \
+		cp "$(ROOT_SRC_DIR)/build/$$sched/$$sched" "$(INSTALL_DIR)/"; \
+	done
+	@cp "$(COMMON_OBJ_DIR)/task_workload_origin" "$(INSTALL_DIR)/"
 
-.PHONY: all lib scheds-c clean install $(C_SCHEDS) $(C_SCHEDS_LIB)
-
-endif  # End of ifeq ($(skip-makefile),)
+clean:
+	$(MAKE) -C $(ROOT_SRC_DIR)/lib clean \
+		SRC_DIR=$(ROOT_SRC_DIR)/lib \
+		LIB_OBJ_DIR=$(LIB_OBJ_DIR)
+	rm -rf $(ROOT_SRC_DIR)/build/common \
+		$(ROOT_SRC_DIR)/build/scx_stairs \
+		$(ROOT_SRC_DIR)/build/scx_erf \
+		$(ROOT_SRC_DIR)/build/scx_scheduler

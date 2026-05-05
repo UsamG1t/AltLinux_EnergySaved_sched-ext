@@ -7,24 +7,23 @@ if [ $# -ne 1 ]; then
     exit 1
 fi
 
-# We sync these schedulers
-rust_scheds=()
-c_scheds=(scx_simple scx_qmap scx_central scx_flatcg)
-
 headers=($(
-    git ls-files include |
-    grep -v include/lib |
-    grep -v include/vmlinux |
-    grep -v include/arch |
+    git ls-files scheds/include |
+    grep -v scheds/include/lib |
+    grep -v scheds/include/vmlinux |
+    grep -v scheds/include/arch |
     grep -v '\.gitignore$'
 ))
 
+sched_dirs=(
+    scheds/scx_stairs
+    scheds/scx_erf
+    scheds/scx_scheduler
+)
+
 scheds=()
-for rust_sched in ${rust_scheds[@]}; do
-    scheds+=($(git ls-files rust/${rust_sched} | grep -Ev 'LICENSE'))
-done
-for c_sched in ${c_scheds[@]}; do
-    scheds+=($(git ls-files c/${c_sched}*))
+for sched_dir in ${sched_dirs[@]}; do
+    scheds+=($(git ls-files "${sched_dir}"))
 done
 
 kernel="$1/tools/sched_ext"
@@ -36,14 +35,14 @@ dsts=()
 
 # Header paths are the same relative to the base directories.
 for file in ${headers[@]}; do
-    dsts+=("$kernel/${file}")
+    dsts+=("$kernel/${file#scheds/}")
 done
 
-# Sched files should drop the first directory component. ie.
-# c/scx_simple.bpf.c should be synced to
-# $kernel/scx_simple.bpf.c.
+# Scheduler files should drop the first two directory components. ie.
+# scheds/scx_erf/scx_erf.bpf.c should be synced to
+# $kernel/scx_erf/scx_erf.bpf.c.
 for file in ${scheds[@]}; do
-    dsts+=("$kernel/${file#*/}")
+    dsts+=("$kernel/${file#scheds/}")
 done
 
 ## debug
@@ -65,27 +64,12 @@ for ((i=0;i<${#srcs[@]};i++)); do
         continue
     fi
 
-    #
-    # As scx_utils is in this repo, rust schedulers point directly to
-    # the source in the tree. As they break outside this tree, drop them
-    # before syncing Cargo.toml files.
-    #
-    if [[ "$src" == */Cargo.toml ]]; then
-        tmp=$(mktemp)
-        sed -r 's/^scx_utils =.*version\s*=\s*"([^"]*)".*$/scx_utils = \"\1"/' < "$src" > "$tmp"
-        src="$tmp"
-    fi
-
     if cmp -s "$src" "$dst"; then
         nr_skipped=$((nr_skipped+1))
         continue
     fi
 
-    if [[ "$orig" == */Cargo.toml ]]; then
-        echo "Syncing $orig (dropped path from scx_utils dependency)"
-    else
-        echo "Syncing $orig"
-    fi
+    echo "Syncing $orig"
 
     mkdir -p "$(dirname "$dst")"
     cp -f "$src" "$dst"

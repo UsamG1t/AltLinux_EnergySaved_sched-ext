@@ -24,7 +24,7 @@
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
 #define MAX_TIME_IN_STATE_STEPS 64
 
-#define LOG_DIR "/tmp/scx_scheduler"
+#define LOG_DIR "results/scx_scheduler"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
