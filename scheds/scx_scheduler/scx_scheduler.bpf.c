@@ -41,6 +41,13 @@ struct {
 	__type(value, struct schedule_runtime_state);
 } schedule_runtime SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, NR_ISOLATED_CPUS);
+	__type(key, __u32);
+	__type(value, struct scheduler_debug_cpu_state);
+} debug_cpu_state SEC(".maps");
+
 static inline bool is_dec(char c)
 {
 	return c >= '0' && c <= '9';
@@ -49,6 +56,54 @@ static inline bool is_dec(char c)
 static inline bool is_isolated_cpu(s32 cpu)
 {
 	return cpu >= ISOLATED_START && cpu <= ISOLATED_END;
+}
+
+static inline s32 isolated_cpu_slot(s32 cpu)
+{
+	if (!is_isolated_cpu(cpu))
+		return -1;
+	return cpu - ISOLATED_START;
+}
+
+static inline struct scheduler_debug_cpu_state *lookup_debug_cpu_state(s32 cpu)
+{
+	s32 slot = isolated_cpu_slot(cpu);
+	u32 key;
+
+	if (slot < 0)
+		return NULL;
+
+	key = (u32)slot;
+	return bpf_map_lookup_elem(&debug_cpu_state, &key);
+}
+
+static inline void copy_task_comm(char dst[SCHEDULER_TASK_COMM_LEN],
+				  const char src[SCHEDULER_TASK_COMM_LEN])
+{
+	__builtin_memcpy(dst, src, SCHEDULER_TASK_COMM_LEN);
+}
+
+static inline void clear_task_comm(char dst[SCHEDULER_TASK_COMM_LEN])
+{
+	__builtin_memset(dst, 0, SCHEDULER_TASK_COMM_LEN);
+}
+
+static inline void record_last_actor(struct scheduler_debug_cpu_state *state,
+				     enum scheduler_debug_event event,
+				     const struct task_struct *p)
+{
+	state->last_event = event;
+	state->last_actor_pid = p->pid;
+	state->last_actor_tgid = p->tgid;
+	copy_task_comm(state->last_actor_comm, p->comm);
+}
+
+static inline void record_idle_actor(struct scheduler_debug_cpu_state *state)
+{
+	state->last_event = SCHEDULER_DEBUG_IDLE_ZERO;
+	state->last_actor_pid = 0;
+	state->last_actor_tgid = 0;
+	clear_task_comm(state->last_actor_comm);
 }
 
 static inline bool parse_sched_task_name(const char *name,
@@ -300,26 +355,53 @@ void BPF_STRUCT_OPS(scheduler_dispatch, s32 cpu, struct task_struct *prev)
 void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 {
 	struct schedule_task_plan plan;
+	struct scheduler_debug_cpu_state *state;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu))
 		return;
 
+	state = lookup_debug_cpu_state(cpu);
 	if (lookup_task_plan(p, &plan) && cpu == (s32)plan.cpu) {
+		if (state) {
+			state->running_planned_hits++;
+			state->perf_apply_hits++;
+			state->last_perf = plan.perf_target;
+			state->last_plan_task_id = plan.task_id;
+			state->last_plan_step_idx = plan.freq_step_idx;
+			state->last_plan_freq_khz = plan.freq_khz;
+			state->last_plan_pid = p->pid;
+			state->last_plan_tgid = p->tgid;
+			copy_task_comm(state->last_plan_comm, p->comm);
+			record_last_actor(state, SCHEDULER_DEBUG_PLANNED_RUNNING, p);
+		}
 		set_cpuperf_target(cpu, plan.perf_target);
 		return;
 	}
 
+	if (state) {
+		state->running_unplanned_hits++;
+		state->zero_from_running_hits++;
+		state->last_perf = 0;
+		record_last_actor(state, SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO, p);
+	}
 	set_cpuperf_target(cpu, 0);
 }
 
 void BPF_STRUCT_OPS(scheduler_stopping, struct task_struct *p, bool runnable)
 {
+	struct scheduler_debug_cpu_state *state;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu) || runnable)
 		return;
 
+	state = lookup_debug_cpu_state(cpu);
+	if (state) {
+		state->zero_from_stopping_hits++;
+		state->last_perf = 0;
+		record_last_actor(state, SCHEDULER_DEBUG_STOPPING_ZERO, p);
+	}
 	set_cpuperf_target(cpu, 0);
 }
 
@@ -329,6 +411,15 @@ void BPF_STRUCT_OPS(scheduler_update_idle, s32 cpu, bool idle)
 		return;
 
 	dispatch_waiting_task(cpu);
+	{
+		struct scheduler_debug_cpu_state *state = lookup_debug_cpu_state(cpu);
+
+		if (state) {
+			state->zero_from_idle_hits++;
+			state->last_perf = 0;
+			record_idle_actor(state);
+		}
+	}
 	set_cpuperf_target(cpu, 0);
 }
 

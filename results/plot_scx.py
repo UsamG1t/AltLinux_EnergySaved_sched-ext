@@ -24,6 +24,21 @@ METRIC_COLORS = {
     "scaling": "#0b6e4f",
     "avg": "#c2410c",
 }
+METRIC_DASHES = {
+    "policy": None,
+    "scaling": "8 4",
+    "avg": "2 3",
+}
+METRIC_LINESTYLES = {
+    "policy": "-",
+    "scaling": "--",
+    "avg": ":",
+}
+METRIC_WIDTHS = {
+    "policy": 2.2,
+    "scaling": 2.0,
+    "avg": 2.0,
+}
 
 
 def parse_time_range(spec: str) -> tuple[float, float]:
@@ -301,7 +316,9 @@ def render_svg_panel(parts: list[str], rows: list[dict[str, float]], cpu: int,
         )
         parts.append(
             f'<polyline fill="none" stroke="{METRIC_COLORS[metric]}" '
-            f'stroke-width="2" points="{svg_points}"/>'
+            f'stroke-width="{METRIC_WIDTHS[metric]:.1f}" '
+            + (f'stroke-dasharray="{METRIC_DASHES[metric]}" ' if METRIC_DASHES[metric] else "")
+            + f'points="{svg_points}"/>'
         )
 
     if not has_data:
@@ -409,7 +426,8 @@ def plot_cpu(ax, rows: list[dict[str, float]], cpu: int,
             times,
             freqs,
             where="post",
-            linewidth=1.8,
+            linewidth=METRIC_WIDTHS[metric],
+            linestyle=METRIC_LINESTYLES[metric],
             color=METRIC_COLORS[metric],
             label=METRIC_LABELS[metric],
         )

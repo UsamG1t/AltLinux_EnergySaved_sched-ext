@@ -28,6 +28,12 @@
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
+struct cpu_freq_reader {
+	int cpu;
+	int fd;
+	char path[PATH_MAX];
+};
+
 struct cpu_tis_reader {
 	int fd;
 	size_t nr_entries;
@@ -42,6 +48,40 @@ struct boost_state {
 	bool changed;
 	long original_value;
 };
+
+static const char *debug_event_name(__u32 event)
+{
+	switch (event) {
+	case SCHEDULER_DEBUG_PLANNED_RUNNING:
+		return "plan";
+	case SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO:
+		return "run0";
+	case SCHEDULER_DEBUG_STOPPING_ZERO:
+		return "stop0";
+	case SCHEDULER_DEBUG_IDLE_ZERO:
+		return "idle0";
+	default:
+		return "-";
+	}
+}
+
+static void format_task_comm(const char src[SCHEDULER_TASK_COMM_LEN], char *dst,
+			     size_t size)
+{
+	size_t i;
+
+	if (!size)
+		return;
+
+	for (i = 0; i + 1 < size && i < SCHEDULER_TASK_COMM_LEN && src[i]; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+
+	if (!dst[0]) {
+		dst[0] = '-';
+		dst[1] = '\0';
+	}
+}
 
 struct parsed_schedule {
 	__u64 deadline_ms;
@@ -86,6 +126,17 @@ static void init_tis_readers(struct cpu_tis_reader *readers)
 		readers[i].fd = -1;
 		readers[i].nr_entries = 0;
 		readers[i].have_prev = false;
+		readers[i].path[0] = '\0';
+	}
+}
+
+static void init_cpu_freq_readers(struct cpu_freq_reader *readers)
+{
+	int i;
+
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		readers[i].cpu = isolated_cpus[i];
+		readers[i].fd = -1;
 		readers[i].path[0] = '\0';
 	}
 }
@@ -287,6 +338,94 @@ static void close_tis_readers(struct cpu_tis_reader *readers)
 	}
 }
 
+static int open_cpu_freq_reader_with_candidates(struct cpu_freq_reader *reader,
+						int cpu,
+						const char *const *candidates,
+						size_t nr_candidates)
+{
+	char path[PATH_MAX];
+	size_t i;
+	int fd;
+
+	reader->cpu = cpu;
+	reader->fd = -1;
+	reader->path[0] = '\0';
+
+	for (i = 0; i < nr_candidates; i++) {
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%d/cpufreq/%s",
+			 cpu, candidates[i]);
+		fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+
+		reader->fd = fd;
+		snprintf(reader->path, sizeof(reader->path), "%s", path);
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+static int open_scaling_freq_reader(struct cpu_freq_reader *reader, int cpu)
+{
+	static const char *const candidates[] = {
+		"scaling_cur_freq",
+		"cpuinfo_cur_freq",
+	};
+
+	return open_cpu_freq_reader_with_candidates(reader, cpu, candidates,
+						    sizeof(candidates) /
+							    sizeof(candidates[0]));
+}
+
+static int open_avg_freq_reader(struct cpu_freq_reader *reader, int cpu)
+{
+	static const char *const candidates[] = {
+		"cpuinfo_avg_freq",
+	};
+
+	return open_cpu_freq_reader_with_candidates(reader, cpu, candidates,
+						    sizeof(candidates) /
+							    sizeof(candidates[0]));
+}
+
+static int read_cpu_freq_khz(const struct cpu_freq_reader *reader, long *freq_khz)
+{
+	char buf[64];
+	char *endp;
+	ssize_t nr_read;
+	long parsed;
+
+	if (reader->fd < 0)
+		return -ENOENT;
+
+	nr_read = pread(reader->fd, buf, sizeof(buf) - 1, 0);
+	if (nr_read <= 0)
+		return nr_read ? -errno : -EIO;
+
+	buf[nr_read] = '\0';
+	errno = 0;
+	parsed = strtol(buf, &endp, 10);
+	if (errno || endp == buf)
+		return -EINVAL;
+
+	*freq_khz = parsed;
+	return 0;
+}
+
+static void close_cpu_freq_readers(struct cpu_freq_reader *readers)
+{
+	int i;
+
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		if (readers[i].fd >= 0) {
+			close(readers[i].fd);
+			readers[i].fd = -1;
+		}
+	}
+}
+
 static int open_all_tis_readers(struct cpu_tis_reader *readers)
 {
 	int i;
@@ -406,44 +545,215 @@ static int sample_policy_freq_mhz(struct cpu_tis_reader *reader, bool *valid,
 	return 0;
 }
 
+static int sample_cpu_freq_mhz(const struct cpu_freq_reader *reader, bool *valid,
+			       double *freq_mhz)
+{
+	long freq_khz;
+	int ret;
+
+	*valid = false;
+	*freq_mhz = 0.0;
+
+	ret = read_cpu_freq_khz(reader, &freq_khz);
+	if (ret == -ENOENT)
+		return 0;
+	if (ret < 0)
+		return ret;
+
+	*valid = true;
+	*freq_mhz = (double)freq_khz / 1000.0;
+	return 0;
+}
+
+static int read_debug_states(struct scx_scheduler *skel,
+			     struct scheduler_debug_cpu_state *states)
+{
+	int map_fd = bpf_map__fd(skel->maps.debug_cpu_state);
+	int i;
+
+	memset(states, 0, sizeof(*states) * NR_ISOLATED_CPUS);
+
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		__u32 key = i;
+		int ret;
+
+		ret = bpf_map_lookup_elem(map_fd, &key, &states[i]);
+		if (ret < 0)
+			return -errno;
+
+		states[i].last_plan_comm[SCHEDULER_TASK_COMM_LEN - 1] = '\0';
+		states[i].last_actor_comm[SCHEDULER_TASK_COMM_LEN - 1] = '\0';
+	}
+
+	return 0;
+}
+
 static void write_csv_header(FILE *csv)
 {
 	int i;
 
 	fprintf(csv, "elapsed_sec");
-	for (i = 0; i < NR_ISOLATED_CPUS; i++)
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 		fprintf(csv, ",cpu%d_policy_mhz", isolated_cpus[i]);
+		fprintf(csv, ",cpu%d_scaling_mhz", isolated_cpus[i]);
+		fprintf(csv, ",cpu%d_avg_mhz", isolated_cpus[i]);
+		fprintf(csv,
+			",cpu%d_dbg_last_event,cpu%d_dbg_last_perf,cpu%d_dbg_last_plan_task_id,cpu%d_dbg_last_step,cpu%d_dbg_last_freq_khz,cpu%d_dbg_last_plan_pid,cpu%d_dbg_last_actor_pid,cpu%d_dbg_plan_hits,cpu%d_dbg_unplanned_hits,cpu%d_dbg_set_hits,cpu%d_dbg_zero_run_hits,cpu%d_dbg_zero_stop_hits,cpu%d_dbg_zero_idle_hits",
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
+			isolated_cpus[i]);
+	}
 	fprintf(csv, "\n");
 }
 
-static void write_csv_sample(FILE *csv, double elapsed_sec, const bool *valid,
-			     const double *policy_mhz)
+static void write_csv_freq_field(FILE *csv, bool valid, double freq_mhz)
+{
+	if (valid)
+		fprintf(csv, ",%.6f", freq_mhz);
+	else
+		fprintf(csv, ",nan");
+}
+
+static void write_csv_sample(FILE *csv, double elapsed_sec,
+			     const bool *policy_valid,
+			     const double *policy_mhz,
+			     const bool *scaling_valid,
+			     const double *scaling_mhz,
+			     const bool *avg_valid,
+			     const double *avg_mhz,
+			     const struct scheduler_debug_cpu_state *debug_states)
 {
 	int i;
 
 	fprintf(csv, "%.6f", elapsed_sec);
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		if (valid[i])
-			fprintf(csv, ",%.6f", policy_mhz[i]);
-		else
-			fprintf(csv, ",nan");
+		write_csv_freq_field(csv, policy_valid[i], policy_mhz[i]);
+		write_csv_freq_field(csv, scaling_valid[i], scaling_mhz[i]);
+		write_csv_freq_field(csv, avg_valid[i], avg_mhz[i]);
+		fprintf(csv, ",%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu",
+			debug_states[i].last_event,
+			debug_states[i].last_perf,
+			debug_states[i].last_plan_task_id,
+			debug_states[i].last_plan_step_idx,
+			debug_states[i].last_plan_freq_khz,
+			debug_states[i].last_plan_pid,
+			debug_states[i].last_actor_pid,
+			(unsigned long long)debug_states[i].running_planned_hits,
+			(unsigned long long)debug_states[i].running_unplanned_hits,
+			(unsigned long long)debug_states[i].perf_apply_hits,
+			(unsigned long long)debug_states[i].zero_from_running_hits,
+			(unsigned long long)debug_states[i].zero_from_stopping_hits,
+			(unsigned long long)debug_states[i].zero_from_idle_hits);
 	}
 	fprintf(csv, "\n");
 }
 
-static void print_sample(double elapsed_sec, const bool *valid,
-			 const double *policy_mhz)
+static void print_sample(double elapsed_sec, const bool *policy_valid,
+			 const double *policy_mhz,
+			 const bool *scaling_valid,
+			 const double *scaling_mhz,
+			 const bool *avg_valid,
+			 const double *avg_mhz)
 {
 	int i;
 
 	printf("t=%8.3fs", elapsed_sec);
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		if (valid[i])
-			printf(" cpu%d=%8.3fMHz", isolated_cpus[i], policy_mhz[i]);
-		else
-			printf(" cpu%d=%8sMHz", isolated_cpus[i], "n/a");
+		if (policy_valid[i] && scaling_valid[i] && avg_valid[i]) {
+			printf(" cpu%d=%8.3f|%8.3f/%8.3fMHz", isolated_cpus[i],
+			       policy_mhz[i], scaling_mhz[i], avg_mhz[i]);
+		} else if (scaling_valid[i] && avg_valid[i]) {
+			printf(" cpu%d=%8s|%8.3f/%8.3fMHz", isolated_cpus[i], "n/a",
+			       scaling_mhz[i], avg_mhz[i]);
+		} else if (policy_valid[i] && scaling_valid[i]) {
+			printf(" cpu%d=%8.3f|%8.3f/%8sMHz", isolated_cpus[i],
+			       policy_mhz[i], scaling_mhz[i], "n/a");
+		} else if (policy_valid[i] && avg_valid[i]) {
+			printf(" cpu%d=%8.3f|%8s/%8.3fMHz", isolated_cpus[i],
+			       policy_mhz[i], "n/a", avg_mhz[i]);
+		} else if (policy_valid[i]) {
+			printf(" cpu%d=%8.3f|%8s/%8sMHz", isolated_cpus[i],
+			       policy_mhz[i], "n/a", "n/a");
+		} else if (scaling_valid[i]) {
+			printf(" cpu%d=%8s|%8.3f/%8sMHz", isolated_cpus[i], "n/a",
+			       scaling_mhz[i], "n/a");
+		} else if (avg_valid[i]) {
+			printf(" cpu%d=%8s|%8s/%8.3fMHz", isolated_cpus[i], "n/a",
+			       "n/a", avg_mhz[i]);
+		} else {
+			printf(" cpu%d=%8s|%8s/%8sMHz", isolated_cpus[i], "n/a",
+			       "n/a", "n/a");
+		}
 	}
 	printf("\n");
+}
+
+static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
+{
+	int i;
+
+	printf("dbg:");
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		char plan_comm[SCHEDULER_TASK_COMM_LEN];
+		char actor_comm[SCHEDULER_TASK_COMM_LEN];
+
+		format_task_comm(states[i].last_plan_comm, plan_comm,
+				 sizeof(plan_comm));
+		format_task_comm(states[i].last_actor_comm, actor_comm,
+				 sizeof(actor_comm));
+
+		printf(" cpu%d[ev=%s perf=%u task=%u step=%u freq=%u actor=%s/%u plan=%s/%u hits=%llu/%llu set=%llu z=%llu/%llu/%llu]",
+		       isolated_cpus[i], debug_event_name(states[i].last_event),
+		       states[i].last_perf, states[i].last_plan_task_id,
+		       states[i].last_plan_step_idx,
+		       states[i].last_plan_freq_khz, actor_comm,
+		       states[i].last_actor_pid, plan_comm,
+		       states[i].last_plan_pid,
+		       (unsigned long long)states[i].running_planned_hits,
+		       (unsigned long long)states[i].running_unplanned_hits,
+		       (unsigned long long)states[i].perf_apply_hits,
+		       (unsigned long long)states[i].zero_from_running_hits,
+		       (unsigned long long)states[i].zero_from_stopping_hits,
+		       (unsigned long long)states[i].zero_from_idle_hits);
+	}
+	printf("\n");
+}
+
+static int init_monitor_readers(struct cpu_tis_reader *tis_readers,
+				struct cpu_freq_reader *scaling_readers,
+				struct cpu_freq_reader *avg_readers)
+{
+	int i;
+	int ret;
+
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		ret = open_tis_reader(&tis_readers[i], isolated_cpus[i]);
+		if (ret < 0) {
+			close_tis_readers(tis_readers);
+			close_cpu_freq_readers(scaling_readers);
+			close_cpu_freq_readers(avg_readers);
+			return ret;
+		}
+
+		ret = open_scaling_freq_reader(&scaling_readers[i],
+					       isolated_cpus[i]);
+		if (ret < 0) {
+			fprintf(stderr,
+				"Warning: cpu%d scaling-current source is unavailable\n",
+				isolated_cpus[i]);
+		}
+
+		ret = open_avg_freq_reader(&avg_readers[i], isolated_cpus[i]);
+		if (ret < 0) {
+			fprintf(stderr,
+				"Warning: cpu%d average-frequency source is unavailable\n",
+				isolated_cpus[i]);
+		}
+	}
+
+	return 0;
 }
 
 static bool is_dec_char(char c)
@@ -870,6 +1180,8 @@ int main(int argc, char **argv)
 	struct scx_scheduler *skel = NULL;
 	struct bpf_link *link = NULL;
 	struct cpu_tis_reader tis_readers[NR_ISOLATED_CPUS];
+	struct cpu_freq_reader scaling_readers[NR_ISOLATED_CPUS];
+	struct cpu_freq_reader avg_readers[NR_ISOLATED_CPUS];
 	struct boost_state boost = {};
 	struct parsed_schedule schedule = {};
 	struct schedule_control control = {};
@@ -889,6 +1201,8 @@ int main(int argc, char **argv)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	init_isolated_cpus();
 	init_tis_readers(tis_readers);
+	init_cpu_freq_readers(scaling_readers);
+	init_cpu_freq_readers(avg_readers);
 
 	while ((opt = getopt(argc, argv, "f:h")) != -1) {
 		switch (opt) {
@@ -952,7 +1266,7 @@ restart:
 	}
 	write_csv_header(csv);
 
-	ret = open_all_tis_readers(tis_readers);
+	ret = init_monitor_readers(tis_readers, scaling_readers, avg_readers);
 	if (ret < 0)
 		goto out;
 
@@ -969,12 +1283,17 @@ restart:
 		       boost.original_value);
 	printf("Monitoring isolated CPUs 6-9 every %.3f s\n",
 	       sample_interval_sec);
-	printf("Sample format: policy MHz from time_in_state\n");
+	printf("Sample format: policy|scaling_cur/cpuinfo_avg MHz\n");
 	printf("Logging samples to %s\n", LOG_CSV_PATH);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		bool valid[NR_ISOLATED_CPUS] = {};
+		bool policy_valid[NR_ISOLATED_CPUS] = {};
+		bool scaling_valid[NR_ISOLATED_CPUS] = {};
+		bool avg_valid[NR_ISOLATED_CPUS] = {};
 		double policy_mhz[NR_ISOLATED_CPUS] = {};
+		double scaling_mhz[NR_ISOLATED_CPUS] = {};
+		double avg_mhz[NR_ISOLATED_CPUS] = {};
+		struct scheduler_debug_cpu_state debug_states[NR_ISOLATED_CPUS] = {};
 		struct timespec now_ts;
 		double elapsed_sec;
 		int i;
@@ -988,14 +1307,32 @@ restart:
 			1000000000.0;
 
 		for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-			ret = sample_policy_freq_mhz(&tis_readers[i], &valid[i],
+			ret = sample_policy_freq_mhz(&tis_readers[i], &policy_valid[i],
 						     &policy_mhz[i]);
+			if (ret < 0)
+				goto out;
+
+			ret = sample_cpu_freq_mhz(&scaling_readers[i], &scaling_valid[i],
+						  &scaling_mhz[i]);
+			if (ret < 0)
+				goto out;
+
+			ret = sample_cpu_freq_mhz(&avg_readers[i], &avg_valid[i],
+						  &avg_mhz[i]);
 			if (ret < 0)
 				goto out;
 		}
 
-		print_sample(elapsed_sec, valid, policy_mhz);
-		write_csv_sample(csv, elapsed_sec, valid, policy_mhz);
+		ret = read_debug_states(skel, debug_states);
+		if (ret < 0)
+			goto out;
+
+		print_sample(elapsed_sec, policy_valid, policy_mhz, scaling_valid,
+			     scaling_mhz, avg_valid, avg_mhz);
+		print_debug_sample(debug_states);
+		write_csv_sample(csv, elapsed_sec, policy_valid, policy_mhz,
+				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
+				 debug_states);
 
 		next_sample_ns += interval_ns;
 		ret = sleep_until_ns(next_sample_ns);
@@ -1005,6 +1342,8 @@ restart:
 
 out:
 	close_tis_readers(tis_readers);
+	close_cpu_freq_readers(scaling_readers);
+	close_cpu_freq_readers(avg_readers);
 	if (csv)
 		fclose(csv);
 	if (link)
@@ -1016,6 +1355,8 @@ out:
 
 	if (!ret && UEI_ECODE_RESTART(ecode)) {
 		init_tis_readers(tis_readers);
+		init_cpu_freq_readers(scaling_readers);
+		init_cpu_freq_readers(avg_readers);
 		csv = NULL;
 		link = NULL;
 		skel = NULL;
