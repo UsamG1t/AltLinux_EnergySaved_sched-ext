@@ -26,6 +26,7 @@
 
 #define LOG_DIR "results/scx_scheduler"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
+#define LOG_DBG_PATH LOG_DIR "/dbg.log"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 
 struct cpu_freq_reader {
@@ -652,6 +653,47 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 	fprintf(csv, "\n");
 }
 
+static void write_sample_line(FILE *out, double elapsed_sec,
+			      const bool *policy_valid,
+			      const double *policy_mhz,
+			      const bool *scaling_valid,
+			      const double *scaling_mhz,
+			      const bool *avg_valid,
+			      const double *avg_mhz)
+{
+	int i;
+
+	fprintf(out, "t=%8.3fs", elapsed_sec);
+	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
+		if (policy_valid[i] && scaling_valid[i] && avg_valid[i]) {
+			fprintf(out, " cpu%d=%8.3f|%8.3f/%8.3fMHz", isolated_cpus[i],
+				policy_mhz[i], scaling_mhz[i], avg_mhz[i]);
+		} else if (scaling_valid[i] && avg_valid[i]) {
+			fprintf(out, " cpu%d=%8s|%8.3f/%8.3fMHz", isolated_cpus[i],
+				"n/a", scaling_mhz[i], avg_mhz[i]);
+		} else if (policy_valid[i] && scaling_valid[i]) {
+			fprintf(out, " cpu%d=%8.3f|%8.3f/%8sMHz", isolated_cpus[i],
+				policy_mhz[i], scaling_mhz[i], "n/a");
+		} else if (policy_valid[i] && avg_valid[i]) {
+			fprintf(out, " cpu%d=%8.3f|%8s/%8.3fMHz", isolated_cpus[i],
+				policy_mhz[i], "n/a", avg_mhz[i]);
+		} else if (policy_valid[i]) {
+			fprintf(out, " cpu%d=%8.3f|%8s/%8sMHz", isolated_cpus[i],
+				policy_mhz[i], "n/a", "n/a");
+		} else if (scaling_valid[i]) {
+			fprintf(out, " cpu%d=%8s|%8.3f/%8sMHz", isolated_cpus[i],
+				"n/a", scaling_mhz[i], "n/a");
+		} else if (avg_valid[i]) {
+			fprintf(out, " cpu%d=%8s|%8s/%8.3fMHz", isolated_cpus[i],
+				"n/a", "n/a", avg_mhz[i]);
+		} else {
+			fprintf(out, " cpu%d=%8s|%8s/%8sMHz", isolated_cpus[i],
+				"n/a", "n/a", "n/a");
+		}
+	}
+	fprintf(out, "\n");
+}
+
 static void print_sample(double elapsed_sec, const bool *policy_valid,
 			 const double *policy_mhz,
 			 const bool *scaling_valid,
@@ -659,44 +701,16 @@ static void print_sample(double elapsed_sec, const bool *policy_valid,
 			 const bool *avg_valid,
 			 const double *avg_mhz)
 {
-	int i;
-
-	printf("t=%8.3fs", elapsed_sec);
-	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
-		if (policy_valid[i] && scaling_valid[i] && avg_valid[i]) {
-			printf(" cpu%d=%8.3f|%8.3f/%8.3fMHz", isolated_cpus[i],
-			       policy_mhz[i], scaling_mhz[i], avg_mhz[i]);
-		} else if (scaling_valid[i] && avg_valid[i]) {
-			printf(" cpu%d=%8s|%8.3f/%8.3fMHz", isolated_cpus[i], "n/a",
-			       scaling_mhz[i], avg_mhz[i]);
-		} else if (policy_valid[i] && scaling_valid[i]) {
-			printf(" cpu%d=%8.3f|%8.3f/%8sMHz", isolated_cpus[i],
-			       policy_mhz[i], scaling_mhz[i], "n/a");
-		} else if (policy_valid[i] && avg_valid[i]) {
-			printf(" cpu%d=%8.3f|%8s/%8.3fMHz", isolated_cpus[i],
-			       policy_mhz[i], "n/a", avg_mhz[i]);
-		} else if (policy_valid[i]) {
-			printf(" cpu%d=%8.3f|%8s/%8sMHz", isolated_cpus[i],
-			       policy_mhz[i], "n/a", "n/a");
-		} else if (scaling_valid[i]) {
-			printf(" cpu%d=%8s|%8.3f/%8sMHz", isolated_cpus[i], "n/a",
-			       scaling_mhz[i], "n/a");
-		} else if (avg_valid[i]) {
-			printf(" cpu%d=%8s|%8s/%8.3fMHz", isolated_cpus[i], "n/a",
-			       "n/a", avg_mhz[i]);
-		} else {
-			printf(" cpu%d=%8s|%8s/%8sMHz", isolated_cpus[i], "n/a",
-			       "n/a", "n/a");
-		}
-	}
-	printf("\n");
+	write_sample_line(stdout, elapsed_sec, policy_valid, policy_mhz,
+			  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
 }
 
-static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
+static void write_debug_sample_line(FILE *out,
+				    const struct scheduler_debug_cpu_state *states)
 {
 	int i;
 
-	printf("dbg:");
+	fprintf(out, "dbg:");
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 		char plan_comm[SCHEDULER_TASK_COMM_LEN];
 		char actor_comm[SCHEDULER_TASK_COMM_LEN];
@@ -706,22 +720,27 @@ static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
 		format_task_comm(states[i].last_actor_comm, actor_comm,
 				 sizeof(actor_comm));
 
-		printf(" cpu%d[ev=%s perf=%u task=%u step=%u freq=%u actor=%s/%u plan=%s/%u hits=%llu/%llu keep=%llu set=%llu z=%llu/%llu/%llu]",
-		       isolated_cpus[i], debug_event_name(states[i].last_event),
-		       states[i].last_perf, states[i].last_plan_task_id,
-		       states[i].last_plan_step_idx,
-		       states[i].last_plan_freq_khz, actor_comm,
-		       states[i].last_actor_pid, plan_comm,
-		       states[i].last_plan_pid,
-		       (unsigned long long)states[i].running_planned_hits,
-		       (unsigned long long)states[i].running_unplanned_hits,
-		       (unsigned long long)states[i].keep_from_running_hits,
-		       (unsigned long long)states[i].perf_apply_hits,
-		       (unsigned long long)states[i].zero_from_running_hits,
-		       (unsigned long long)states[i].zero_from_stopping_hits,
-		       (unsigned long long)states[i].zero_from_idle_hits);
+		fprintf(out, " cpu%d[ev=%s perf=%u task=%u step=%u freq=%u actor=%s/%u plan=%s/%u hits=%llu/%llu keep=%llu set=%llu z=%llu/%llu/%llu]",
+			isolated_cpus[i], debug_event_name(states[i].last_event),
+			states[i].last_perf, states[i].last_plan_task_id,
+			states[i].last_plan_step_idx,
+			states[i].last_plan_freq_khz, actor_comm,
+			states[i].last_actor_pid, plan_comm,
+			states[i].last_plan_pid,
+			(unsigned long long)states[i].running_planned_hits,
+			(unsigned long long)states[i].running_unplanned_hits,
+			(unsigned long long)states[i].keep_from_running_hits,
+			(unsigned long long)states[i].perf_apply_hits,
+			(unsigned long long)states[i].zero_from_running_hits,
+			(unsigned long long)states[i].zero_from_stopping_hits,
+			(unsigned long long)states[i].zero_from_idle_hits);
 	}
-	printf("\n");
+	fprintf(out, "\n");
+}
+
+static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
+{
+	write_debug_sample_line(stdout, states);
 }
 
 static int init_monitor_readers(struct cpu_tis_reader *tis_readers,
@@ -1190,6 +1209,7 @@ int main(int argc, char **argv)
 	struct schedule_control control = {};
 	struct timespec start_ts;
 	FILE *csv = NULL;
+	FILE *dbg = NULL;
 	double sample_interval_sec = 1.0;
 	const char *schedule_path = NULL;
 	__u64 ecode;
@@ -1269,6 +1289,12 @@ restart:
 	}
 	write_csv_header(csv);
 
+	dbg = open_log_file(LOG_DBG_PATH);
+	if (!dbg) {
+		ret = -errno;
+		goto out;
+	}
+
 	ret = init_monitor_readers(tis_readers, scaling_readers, avg_readers);
 	if (ret < 0)
 		goto out;
@@ -1284,10 +1310,11 @@ restart:
 	if (boost.supported)
 		printf("Boost is disabled for this run (original=%ld)\n",
 		       boost.original_value);
-	printf("Monitoring isolated CPUs 6-9 every %.3f s\n",
-	       sample_interval_sec);
+	printf("Monitoring isolated CPUs %d-%d every %.3f s\n",
+	       ISOLATED_START, ISOLATED_END, sample_interval_sec);
 	printf("Sample format: policy|scaling_cur/cpuinfo_avg MHz\n");
 	printf("Logging samples to %s\n", LOG_CSV_PATH);
+	printf("Logging debug samples to %s\n", LOG_DBG_PATH);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		bool policy_valid[NR_ISOLATED_CPUS] = {};
@@ -1333,6 +1360,9 @@ restart:
 		print_sample(elapsed_sec, policy_valid, policy_mhz, scaling_valid,
 			     scaling_mhz, avg_valid, avg_mhz);
 		print_debug_sample(debug_states);
+		write_sample_line(dbg, elapsed_sec, policy_valid, policy_mhz,
+				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
+		write_debug_sample_line(dbg, debug_states);
 		write_csv_sample(csv, elapsed_sec, policy_valid, policy_mhz,
 				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
 				 debug_states);
@@ -1349,6 +1379,8 @@ out:
 	close_cpu_freq_readers(avg_readers);
 	if (csv)
 		fclose(csv);
+	if (dbg)
+		fclose(dbg);
 	if (link)
 		bpf_link__destroy(link);
 
@@ -1361,6 +1393,7 @@ out:
 		init_cpu_freq_readers(scaling_readers);
 		init_cpu_freq_readers(avg_readers);
 		csv = NULL;
+		dbg = NULL;
 		link = NULL;
 		skel = NULL;
 		exit_req = 0;

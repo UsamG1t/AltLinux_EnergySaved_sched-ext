@@ -3,6 +3,7 @@ build/*
 
 results/*
 !results/plot_scx.py
+!results/dbg_plot.py
 !results/scx_stairs/
 !results/scx_erf/
 !results/scx_scheduler/
