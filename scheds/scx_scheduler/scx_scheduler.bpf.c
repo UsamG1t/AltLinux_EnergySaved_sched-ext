@@ -381,8 +381,15 @@ void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 
 	if (state) {
 		state->running_unplanned_hits++;
+		if (state->last_perf) {
+			state->keep_from_running_hits++;
+			state->perf_apply_hits++;
+			record_last_actor(state, SCHEDULER_DEBUG_UNPLANNED_RUNNING_KEEP, p);
+			set_cpuperf_target(cpu, state->last_perf);
+			return;
+		}
+
 		state->zero_from_running_hits++;
-		state->last_perf = 0;
 		record_last_actor(state, SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO, p);
 	}
 	set_cpuperf_target(cpu, 0);
@@ -390,10 +397,13 @@ void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(scheduler_stopping, struct task_struct *p, bool runnable)
 {
+	struct schedule_task_plan plan;
 	struct scheduler_debug_cpu_state *state;
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	if (!is_isolated_cpu(cpu) || runnable)
+		return;
+	if (!lookup_task_plan(p, &plan) || cpu != (s32)plan.cpu)
 		return;
 
 	state = lookup_debug_cpu_state(cpu);
@@ -416,7 +426,6 @@ void BPF_STRUCT_OPS(scheduler_update_idle, s32 cpu, bool idle)
 
 		if (state) {
 			state->zero_from_idle_hits++;
-			state->last_perf = 0;
 			record_idle_actor(state);
 		}
 	}

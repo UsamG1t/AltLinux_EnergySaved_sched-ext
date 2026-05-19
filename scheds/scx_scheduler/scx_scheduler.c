@@ -54,6 +54,8 @@ static const char *debug_event_name(__u32 event)
 	switch (event) {
 	case SCHEDULER_DEBUG_PLANNED_RUNNING:
 		return "plan";
+	case SCHEDULER_DEBUG_UNPLANNED_RUNNING_KEEP:
+		return "runhold";
 	case SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO:
 		return "run0";
 	case SCHEDULER_DEBUG_STOPPING_ZERO:
@@ -598,12 +600,11 @@ static void write_csv_header(FILE *csv)
 		fprintf(csv, ",cpu%d_scaling_mhz", isolated_cpus[i]);
 		fprintf(csv, ",cpu%d_avg_mhz", isolated_cpus[i]);
 		fprintf(csv,
-			",cpu%d_dbg_last_event,cpu%d_dbg_last_perf,cpu%d_dbg_last_plan_task_id,cpu%d_dbg_last_step,cpu%d_dbg_last_freq_khz,cpu%d_dbg_last_plan_pid,cpu%d_dbg_last_actor_pid,cpu%d_dbg_plan_hits,cpu%d_dbg_unplanned_hits,cpu%d_dbg_set_hits,cpu%d_dbg_zero_run_hits,cpu%d_dbg_zero_stop_hits,cpu%d_dbg_zero_idle_hits",
+			",cpu%d_dbg_last_event,cpu%d_dbg_last_perf,cpu%d_dbg_last_plan_task_id,cpu%d_dbg_last_step,cpu%d_dbg_last_freq_khz,cpu%d_dbg_last_plan_pid,cpu%d_dbg_last_actor_pid,cpu%d_dbg_plan_hits,cpu%d_dbg_unplanned_hits,cpu%d_dbg_keep_run_hits,cpu%d_dbg_set_hits,cpu%d_dbg_zero_run_hits,cpu%d_dbg_zero_stop_hits,cpu%d_dbg_zero_idle_hits",
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
-			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
-			isolated_cpus[i]);
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i]);
 	}
 	fprintf(csv, "\n");
 }
@@ -632,7 +633,7 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 		write_csv_freq_field(csv, policy_valid[i], policy_mhz[i]);
 		write_csv_freq_field(csv, scaling_valid[i], scaling_mhz[i]);
 		write_csv_freq_field(csv, avg_valid[i], avg_mhz[i]);
-		fprintf(csv, ",%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu",
+		fprintf(csv, ",%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu",
 			debug_states[i].last_event,
 			debug_states[i].last_perf,
 			debug_states[i].last_plan_task_id,
@@ -642,6 +643,7 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 			debug_states[i].last_actor_pid,
 			(unsigned long long)debug_states[i].running_planned_hits,
 			(unsigned long long)debug_states[i].running_unplanned_hits,
+			(unsigned long long)debug_states[i].keep_from_running_hits,
 			(unsigned long long)debug_states[i].perf_apply_hits,
 			(unsigned long long)debug_states[i].zero_from_running_hits,
 			(unsigned long long)debug_states[i].zero_from_stopping_hits,
@@ -704,7 +706,7 @@ static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
 		format_task_comm(states[i].last_actor_comm, actor_comm,
 				 sizeof(actor_comm));
 
-		printf(" cpu%d[ev=%s perf=%u task=%u step=%u freq=%u actor=%s/%u plan=%s/%u hits=%llu/%llu set=%llu z=%llu/%llu/%llu]",
+		printf(" cpu%d[ev=%s perf=%u task=%u step=%u freq=%u actor=%s/%u plan=%s/%u hits=%llu/%llu keep=%llu set=%llu z=%llu/%llu/%llu]",
 		       isolated_cpus[i], debug_event_name(states[i].last_event),
 		       states[i].last_perf, states[i].last_plan_task_id,
 		       states[i].last_plan_step_idx,
@@ -713,6 +715,7 @@ static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
 		       states[i].last_plan_pid,
 		       (unsigned long long)states[i].running_planned_hits,
 		       (unsigned long long)states[i].running_unplanned_hits,
+		       (unsigned long long)states[i].keep_from_running_hits,
 		       (unsigned long long)states[i].perf_apply_hits,
 		       (unsigned long long)states[i].zero_from_running_hits,
 		       (unsigned long long)states[i].zero_from_stopping_hits,

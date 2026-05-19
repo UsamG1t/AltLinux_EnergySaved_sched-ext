@@ -7,9 +7,10 @@
 enum scheduler_debug_event {
 	SCHEDULER_DEBUG_NONE = 0,
 	SCHEDULER_DEBUG_PLANNED_RUNNING = 1,
-	SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO = 2,
-	SCHEDULER_DEBUG_STOPPING_ZERO = 3,
-	SCHEDULER_DEBUG_IDLE_ZERO = 4,
+	SCHEDULER_DEBUG_UNPLANNED_RUNNING_KEEP = 2,
+	SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO = 3,
+	SCHEDULER_DEBUG_STOPPING_ZERO = 4,
+	SCHEDULER_DEBUG_IDLE_ZERO = 5,
 };
 
 struct schedule_task_plan {
@@ -28,6 +29,7 @@ struct schedule_task_plan {
 struct scheduler_debug_cpu_state {
 	__u64 running_planned_hits;
 	__u64 running_unplanned_hits;
+	__u64 keep_from_running_hits;
 	__u64 perf_apply_hits;
 	__u64 zero_from_running_hits;
 	__u64 zero_from_stopping_hits;
