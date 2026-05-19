@@ -613,11 +613,10 @@ def plot_dbg_log(path: Path) -> None:
     output_path = path.with_suffix(".analysis.svg")
     fig.savefig(output_path)
 
-    backend = plt.get_backend().lower()
-    if "agg" in backend:
-        print(f"Saved analysis SVG to {output_path}")
-    else:
+    try:
         plt.show()
+    except Exception:
+        print(f"Saved analysis SVG to {output_path}")
 
 
 def main() -> int:
