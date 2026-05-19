@@ -461,12 +461,21 @@ def launch_simulation(args: argparse.Namespace, deadline_ms: int, plans: list[Ta
 
     try:
         for plan in release_plans:
+            if scheduler_proc.poll() is not None:
+                raise SimulatorError(
+                    f"Scheduler exited early during task release with rc={scheduler_proc.returncode}"
+                )
+
             target_time = start_monotonic + plan.ready_ms / 1000.0
             while True:
                 now = time.monotonic()
                 remaining = target_time - now
                 if remaining <= 0:
                     break
+                if scheduler_proc.poll() is not None:
+                    raise SimulatorError(
+                        f"Scheduler exited early while waiting for task release with rc={scheduler_proc.returncode}"
+                    )
                 time.sleep(min(remaining, 0.01))
 
             task_path = run_dir / plan.name
@@ -493,6 +502,10 @@ def launch_simulation(args: argparse.Namespace, deadline_ms: int, plans: list[Ta
                     stderr_data = proc.stderr.read()
                 sys.stderr.write(
                     f"{plan.name} exited with rc={rc}\n{stderr_data.decode('utf-8', errors='replace')}"
+                )
+            if scheduler_proc.poll() is not None:
+                raise SimulatorError(
+                    f"Scheduler exited before workload completion with rc={scheduler_proc.returncode}"
                 )
 
         if scheduler_proc.poll() is None:
