@@ -6,6 +6,8 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+#define TRACE_CB(fmt, args...) bpf_printk("scx_scheduler " fmt, ##args)
+
 #define SHARED_DSQ 0
 #define WAIT_DSQ_BASE 0x1000
 #define ISOLATED_START 6
@@ -302,17 +304,24 @@ s32 BPF_STRUCT_OPS(scheduler_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bool is_idle = false;
 	s32 cpu;
 
-	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu))
+	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
+		TRACE_CB("cb=select_cpu case=plan pid=%d task=%u cpu=%d",
+			 p->pid, plan.task_id, plan.cpu);
 		return plan.cpu;
+	}
 
 	cpu = pick_non_isolated_cpu(p, &is_idle);
 	if (cpu >= 0) {
+		TRACE_CB("cb=select_cpu case=noniso pid=%d cpu=%d idle=%d",
+			 p->pid, cpu, is_idle);
 		if (is_idle)
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 		return cpu;
 	}
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+	TRACE_CB("cb=select_cpu case=dfl pid=%d cpu=%d idle=%d",
+		 p->pid, cpu, is_idle);
 	if (is_idle && !is_isolated_cpu(cpu))
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 
@@ -325,6 +334,9 @@ void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 
 	if (lookup_task_plan(p, &plan) && planned_cpu_allowed(p, plan.cpu)) {
+		TRACE_CB("cb=enqueue case=plan pid=%d task=%u cpu=%u step=%u freq=%u",
+			 p->pid, plan.task_id, plan.cpu, plan.freq_step_idx,
+			 plan.freq_khz);
 		enqueue_planned_task(p, &plan, enq_flags);
 		return;
 	}
@@ -332,24 +344,29 @@ void BPF_STRUCT_OPS(scheduler_enqueue, struct task_struct *p, u64 enq_flags)
 	if (is_pinned(p)) {
 		cpu = scx_bpf_pick_any_cpu(p->cpus_ptr, 0);
 		if (cpu >= 0) {
+			TRACE_CB("cb=enqueue case=pinned pid=%d cpu=%d", p->pid, cpu);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu,
 					   SCX_SLICE_DFL, enq_flags);
 			return;
 		}
 	}
 
+	TRACE_CB("cb=enqueue case=shared pid=%d", p->pid);
 	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(scheduler_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (is_isolated_cpu(cpu)) {
+		TRACE_CB("cb=dispatch case=isolated cpu=%d prev_pid=%d",
+			 cpu, prev ? prev->pid : 0);
 		dispatch_waiting_task(cpu);
 		return;
 	}
 
-	if (!is_isolated_cpu(cpu))
-		scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	TRACE_CB("cb=dispatch case=shared cpu=%d prev_pid=%d",
+		 cpu, prev ? prev->pid : 0);
+	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
 void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
@@ -363,6 +380,8 @@ void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 
 	state = lookup_debug_cpu_state(cpu);
 	if (lookup_task_plan(p, &plan) && cpu == (s32)plan.cpu) {
+		TRACE_CB("cb=running case=plan cpu=%d pid=%d task=%u perf=%u",
+			 cpu, p->pid, plan.task_id, plan.perf_target);
 		if (state) {
 			state->running_planned_hits++;
 			state->perf_apply_hits++;
@@ -382,6 +401,8 @@ void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 	if (state) {
 		state->running_unplanned_hits++;
 		if (state->last_perf) {
+			TRACE_CB("cb=running case=keep cpu=%d pid=%d perf=%u",
+				 cpu, p->pid, state->last_perf);
 			state->keep_from_running_hits++;
 			state->perf_apply_hits++;
 			record_last_actor(state, SCHEDULER_DEBUG_UNPLANNED_RUNNING_KEEP, p);
@@ -392,6 +413,7 @@ void BPF_STRUCT_OPS(scheduler_running, struct task_struct *p)
 		state->zero_from_running_hits++;
 		record_last_actor(state, SCHEDULER_DEBUG_UNPLANNED_RUNNING_ZERO, p);
 	}
+	TRACE_CB("cb=running case=zero cpu=%d pid=%d", cpu, p->pid);
 	set_cpuperf_target(cpu, 0);
 }
 
@@ -406,6 +428,8 @@ void BPF_STRUCT_OPS(scheduler_stopping, struct task_struct *p, bool runnable)
 	if (!lookup_task_plan(p, &plan) || cpu != (s32)plan.cpu)
 		return;
 
+	TRACE_CB("cb=stopping case=planned_done cpu=%d pid=%d task=%u",
+		 cpu, p->pid, plan.task_id);
 	state = lookup_debug_cpu_state(cpu);
 	if (state) {
 		state->zero_from_stopping_hits++;
@@ -420,6 +444,7 @@ void BPF_STRUCT_OPS(scheduler_update_idle, s32 cpu, bool idle)
 	if (!idle || !is_isolated_cpu(cpu))
 		return;
 
+	TRACE_CB("cb=update_idle case=idle cpu=%d", cpu);
 	dispatch_waiting_task(cpu);
 	{
 		struct scheduler_debug_cpu_state *state = lookup_debug_cpu_state(cpu);
@@ -436,6 +461,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(scheduler_init)
 {
 	const struct cpumask *online = scx_bpf_get_online_cpumask();
 	int i;
+
+	TRACE_CB("cb=init cpus=%d-%d", ISOLATED_START, ISOLATED_END);
 
 	#pragma unroll
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
@@ -460,6 +487,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(scheduler_init)
 
 void BPF_STRUCT_OPS(scheduler_exit, struct scx_exit_info *ei)
 {
+	TRACE_CB("cb=exit");
 	UEI_RECORD(uei, ei);
 }
 

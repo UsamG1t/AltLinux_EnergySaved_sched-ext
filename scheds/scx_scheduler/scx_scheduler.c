@@ -605,7 +605,8 @@ static void write_csv_header(FILE *csv)
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
-			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i]);
+			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
+			isolated_cpus[i], isolated_cpus[i]);
 	}
 	fprintf(csv, "\n");
 }
@@ -694,15 +695,16 @@ static void write_sample_line(FILE *out, double elapsed_sec,
 	fprintf(out, "\n");
 }
 
-static void print_sample(double elapsed_sec, const bool *policy_valid,
-			 const double *policy_mhz,
-			 const bool *scaling_valid,
-			 const double *scaling_mhz,
-			 const bool *avg_valid,
-			 const double *avg_mhz)
+static void maybe_print_progress_timer(double elapsed_sec, int *last_sec)
 {
-	write_sample_line(stdout, elapsed_sec, policy_valid, policy_mhz,
-			  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
+	int sec = (int)elapsed_sec;
+
+	if (sec == *last_sec)
+		return;
+
+	*last_sec = sec;
+	printf("\rElapsed: %4d s", sec);
+	fflush(stdout);
 }
 
 static void write_debug_sample_line(FILE *out,
@@ -736,11 +738,6 @@ static void write_debug_sample_line(FILE *out,
 			(unsigned long long)states[i].zero_from_idle_hits);
 	}
 	fprintf(out, "\n");
-}
-
-static void print_debug_sample(const struct scheduler_debug_cpu_state *states)
-{
-	write_debug_sample_line(stdout, states);
 }
 
 static int init_monitor_readers(struct cpu_tis_reader *tis_readers,
@@ -1216,6 +1213,7 @@ int main(int argc, char **argv)
 	__u64 interval_ns;
 	__u64 next_sample_ns;
 	int opt;
+	int last_timer_sec = -1;
 	int ret = 0;
 
 	libbpf_set_print(libbpf_print_fn);
@@ -1357,15 +1355,13 @@ restart:
 		if (ret < 0)
 			goto out;
 
-		print_sample(elapsed_sec, policy_valid, policy_mhz, scaling_valid,
-			     scaling_mhz, avg_valid, avg_mhz);
-		print_debug_sample(debug_states);
 		write_sample_line(dbg, elapsed_sec, policy_valid, policy_mhz,
 				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
 		write_debug_sample_line(dbg, debug_states);
 		write_csv_sample(csv, elapsed_sec, policy_valid, policy_mhz,
 				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
 				 debug_states);
+		maybe_print_progress_timer(elapsed_sec, &last_timer_sec);
 
 		next_sample_ns += interval_ns;
 		ret = sleep_until_ns(next_sample_ns);
@@ -1392,6 +1388,7 @@ out:
 		init_tis_readers(tis_readers);
 		init_cpu_freq_readers(scaling_readers);
 		init_cpu_freq_readers(avg_readers);
+		last_timer_sec = -1;
 		csv = NULL;
 		dbg = NULL;
 		link = NULL;
@@ -1399,6 +1396,9 @@ out:
 		exit_req = 0;
 		goto restart;
 	}
+
+	if (last_timer_sec >= 0)
+		printf("\n");
 
 	restore_boost(&boost);
 	free_parsed_schedule(&schedule);
