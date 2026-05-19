@@ -115,6 +115,13 @@ def metric_field(cpu: int, metric: str) -> str:
     return f"cpu{cpu}_{metric}_mhz"
 
 
+def parse_float_or_nan(value: str) -> float:
+    text = value.strip()
+    if not text or text.lower() in {"none", "nan"}:
+        return math.nan
+    return float(text)
+
+
 def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], list[dict[str, float]]]:
     rows: list[dict[str, float]] = []
 
@@ -159,7 +166,7 @@ def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], list[dict[str
                         continue
 
                     value = raw_row.get(field, "")
-                    row[key] = float(value)
+                    row[key] = parse_float_or_nan(value)
             rows.append(row)
 
     return cpus, metrics, rows

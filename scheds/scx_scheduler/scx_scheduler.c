@@ -325,6 +325,13 @@ static int open_tis_reader(struct cpu_tis_reader *reader, int cpu)
 	if (reader->fd >= 0)
 		return 0;
 
+	if (errno == ENOENT) {
+		fprintf(stderr,
+			"Warning: %s is unavailable, policy MHz samples for CPU%d will be None\n",
+			reader->path, cpu);
+		return 0;
+	}
+
 	fprintf(stderr, "Could not open %s\n", reader->path);
 	return -errno;
 }
@@ -616,7 +623,7 @@ static void write_csv_freq_field(FILE *csv, bool valid, double freq_mhz)
 	if (valid)
 		fprintf(csv, ",%.6f", freq_mhz);
 	else
-		fprintf(csv, ",nan");
+		fprintf(csv, ",None");
 }
 
 static void write_csv_sample(FILE *csv, double elapsed_sec,
