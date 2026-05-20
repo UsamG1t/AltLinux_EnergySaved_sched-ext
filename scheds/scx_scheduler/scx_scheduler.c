@@ -8,6 +8,7 @@
 #include <math.h>
 #include <scx/common.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -747,6 +748,15 @@ static void write_debug_sample_line(FILE *out,
 	fprintf(out, "\n");
 }
 
+static void set_fail_stage(char *buf, size_t size, const char *fmt, ...)
+{
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintf(buf, size, fmt, args);
+	va_end(args);
+}
+
 static int init_monitor_readers(struct cpu_tis_reader *tis_readers,
 				struct cpu_freq_reader *scaling_readers,
 				struct cpu_freq_reader *avg_readers)
@@ -1219,6 +1229,7 @@ int main(int argc, char **argv)
 	__u64 ecode;
 	__u64 interval_ns;
 	__u64 next_sample_ns;
+	char fail_stage[128] = "startup";
 	int opt;
 	int last_timer_sec = -1;
 	int ret = 0;
@@ -1261,16 +1272,21 @@ int main(int argc, char **argv)
 		return 1;
 
 	ret = validate_parsed_schedule(&schedule);
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "validate_parsed_schedule");
 		goto out;
+	}
 
 	control.deadline_ns = schedule.deadline_ms * 1000000ULL;
 	control.nr_tasks = schedule.nr_plans;
 	control.reserved = 0;
 
 	ret = disable_boost(&boost);
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage), "disable_boost");
 		goto out;
+	}
 
 restart:
 	skel = SCX_OPS_OPEN(scheduler_ops, scx_scheduler);
@@ -1278,18 +1294,24 @@ restart:
 
 	ret = load_schedule_maps(skel, &control, schedule.plans,
 				 schedule.nr_plans);
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage), "load_schedule_maps");
 		goto out;
+	}
 
 	link = SCX_OPS_ATTACH(skel, scheduler_ops, scx_scheduler);
 
 	ret = ensure_log_dir();
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage), "ensure_log_dir");
 		goto out;
+	}
 
 	csv = open_log_file(LOG_CSV_PATH);
 	if (!csv) {
 		ret = -errno;
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "open_log_file(%s)", LOG_CSV_PATH);
 		goto out;
 	}
 	write_csv_header(csv);
@@ -1297,16 +1319,24 @@ restart:
 	dbg = open_log_file(LOG_DBG_PATH);
 	if (!dbg) {
 		ret = -errno;
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "open_log_file(%s)", LOG_DBG_PATH);
 		goto out;
 	}
 
 	ret = init_monitor_readers(tis_readers, scaling_readers, avg_readers);
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "init_monitor_readers");
 		goto out;
+	}
 
 	ret = monotonic_now(&start_ts);
-	if (ret < 0)
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "monotonic_now(start_ts)");
 		goto out;
+	}
 
 	interval_ns = (__u64)(sample_interval_sec * 1000000000.0);
 	next_sample_ns = timespec_to_ns(&start_ts);
@@ -1334,8 +1364,11 @@ restart:
 		int i;
 
 		ret = monotonic_now(&now_ts);
-		if (ret < 0)
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage),
+				       "monotonic_now(sample)");
 			goto out;
+		}
 
 		elapsed_sec =
 			(double)(timespec_to_ns(&now_ts) - timespec_to_ns(&start_ts)) /
@@ -1344,23 +1377,38 @@ restart:
 		for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 			ret = sample_policy_freq_mhz(&tis_readers[i], &policy_valid[i],
 						     &policy_mhz[i]);
-			if (ret < 0)
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sample_policy_freq_mhz(cpu=%d)",
+					       isolated_cpus[i]);
 				goto out;
+			}
 
 			ret = sample_cpu_freq_mhz(&scaling_readers[i], &scaling_valid[i],
 						  &scaling_mhz[i]);
-			if (ret < 0)
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sample_cpu_freq_mhz(scaling,cpu=%d)",
+					       isolated_cpus[i]);
 				goto out;
+			}
 
 			ret = sample_cpu_freq_mhz(&avg_readers[i], &avg_valid[i],
 						  &avg_mhz[i]);
-			if (ret < 0)
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sample_cpu_freq_mhz(avg,cpu=%d)",
+					       isolated_cpus[i]);
 				goto out;
+			}
 		}
 
 		ret = read_debug_states(skel, debug_states);
-		if (ret < 0)
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage),
+				       "read_debug_states");
 			goto out;
+		}
 
 		write_sample_line(dbg, elapsed_sec, policy_valid, policy_mhz,
 				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
@@ -1372,8 +1420,11 @@ restart:
 
 		next_sample_ns += interval_ns;
 		ret = sleep_until_ns(next_sample_ns);
-		if (ret < 0)
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage),
+				       "sleep_until_ns");
 			goto out;
+		}
 	}
 
 out:
@@ -1386,6 +1437,10 @@ out:
 		fclose(dbg);
 	if (link)
 		bpf_link__destroy(link);
+
+	if (ret < 0)
+		fprintf(stderr, "USERSPACE ERROR: stage=%s ret=%d (%s)\n",
+			fail_stage, ret, strerror(-ret));
 
 	ecode = skel ? UEI_REPORT(skel, uei) : 0;
 	if (skel)
