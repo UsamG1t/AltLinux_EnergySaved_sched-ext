@@ -511,8 +511,9 @@ static int sample_policy_freq_mhz(struct cpu_tis_reader *reader, bool *valid,
 	ssize_t nr_read;
 
 	*valid = false;
+	*policy_mhz = 0.0;
 	if (reader->fd < 0)
-		return -ENOENT;
+		return 0;
 
 	nr_read = pread(reader->fd, buf, sizeof(buf) - 1, 0);
 	if (nr_read <= 0)
