@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -167,6 +168,108 @@ def parse_schedule_file(path: Path) -> tuple[int, list[TaskInput]]:
     return deadline_ms, tasks
 
 
+def parse_static_int_field(path: Path, line_no: int, line: str, prefix: str) -> int | None:
+    if not line.startswith(prefix):
+        return None
+
+    rest = line[len(prefix) :].lstrip(":= \t")
+    if not rest.isdigit():
+        raise SimulatorError(f"{path}:{line_no}: invalid {prefix} line")
+    return int(rest)
+
+
+def parse_static_schedule_file(path: Path) -> tuple[int, list[TaskPlan]]:
+    deadline_ms: int | None = None
+    declared_nr_tasks: int | None = None
+    plans: list[TaskPlan] = []
+
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        maybe_deadline = parse_static_int_field(path, line_no, line, "deadline_ms")
+        if maybe_deadline is not None:
+            deadline_ms = maybe_deadline
+            continue
+
+        maybe_nr_tasks = parse_static_int_field(path, line_no, line, "nr_tasks")
+        if maybe_nr_tasks is not None:
+            declared_nr_tasks = maybe_nr_tasks
+            continue
+
+        parts = line.split()
+        if len(parts) != 10 or not all(part.isdigit() for part in parts):
+            raise SimulatorError(f"{path}:{line_no}: invalid static schedule line")
+
+        (
+            task_id,
+            runtime_ms,
+            ready_ms,
+            cpu,
+            freq_step_idx,
+            freq_khz,
+            perf_target,
+            order,
+            start_ns,
+            duration_ns,
+        ) = map(int, parts)
+
+        plans.append(
+            TaskPlan(
+                task_id=task_id,
+                runtime_ms=runtime_ms,
+                ready_ms=ready_ms,
+                cpu=cpu,
+                freq_step_idx=freq_step_idx,
+                freq_khz=freq_khz,
+                perf_target=perf_target,
+                order=order,
+                start_ns=start_ns,
+                duration_ns=duration_ns,
+            )
+        )
+
+    if deadline_ms is None or deadline_ms <= 0:
+        raise SimulatorError(f"{path}: deadline_ms is missing")
+    if not plans:
+        raise SimulatorError(f"{path}: static schedule does not contain any tasks")
+    if declared_nr_tasks is not None and declared_nr_tasks != len(plans):
+        raise SimulatorError(
+            f"{path}: static schedule declares {declared_nr_tasks} tasks, "
+            f"but contains {len(plans)} entries"
+        )
+
+    plans.sort(key=lambda plan: plan.task_id)
+    for idx, plan in enumerate(plans):
+        if plan.task_id <= 0:
+            raise SimulatorError(f"{path}: task id 0 is not allowed")
+        if plan.runtime_ms <= 0 or plan.duration_ns <= 0:
+            raise SimulatorError(
+                f"{path}: task{plan.task_id} has zero runtime or zero duration"
+            )
+        if plan.ready_ms >= deadline_ms:
+            raise SimulatorError(
+                f"{path}: task{plan.task_id} ready time {plan.ready_ms} is not earlier than deadline"
+            )
+        if plan.cpu not in ISOLATED_CPUS:
+            raise SimulatorError(
+                f"{path}: task{plan.task_id} targets CPU{plan.cpu}, which is not in ISOLATED_CPUS"
+            )
+        if plan.start_ns < plan.ready_ms * 1_000_000:
+            raise SimulatorError(
+                f"{path}: task{plan.task_id} starts before its ready time"
+            )
+        if plan.start_ns + plan.duration_ns > deadline_ms * 1_000_000:
+            raise SimulatorError(
+                f"{path}: task{plan.task_id} exceeds deadline in static schedule"
+            )
+        if idx and plans[idx - 1].task_id == plan.task_id:
+            raise SimulatorError(f"{path}: duplicate task id {plan.task_id}")
+
+    return deadline_ms, plans
+
+
 def choose_earliest_finish_cpu(
     cpu_states: list[dict[str, int]], task: TaskInput
 ) -> tuple[int, int, int]:
@@ -283,10 +386,13 @@ def build_erf_schedule(deadline_ms: int, tasks: list[TaskInput]) -> list[TaskPla
     return plans
 
 
-def print_schedule(deadline_ms: int, plans: Iterable[TaskPlan]) -> None:
+def print_schedule(deadline_ms: int, plans: Iterable[TaskPlan], label: str = "ERF") -> None:
     sorted_plans = sorted(plans, key=lambda plan: (plan.cpu, plan.order))
-    print(f"Loaded ERF schedule for {len(sorted_plans)} tasks, deadline {deadline_ms:.3f} ms")
-    print(f"Per-task slack reserve: {ERF_SLACK_PCT}% of each scheduling window")
+    print(
+        f"Loaded {label} schedule for {len(sorted_plans)} tasks, deadline {deadline_ms:.3f} ms"
+    )
+    if label == "ERF":
+        print(f"Per-task slack reserve: {ERF_SLACK_PCT}% of each scheduling window")
     for idx, plan in enumerate(sorted_plans):
         if idx == 0 or sorted_plans[idx - 1].cpu != plan.cpu:
             print(f"CPU{plan.cpu}")
@@ -402,7 +508,12 @@ def calibration_env_vars(args: argparse.Namespace, coeff: int) -> dict[str, str]
     return env
 
 
-def launch_simulation(args: argparse.Namespace, deadline_ms: int, plans: list[TaskPlan]) -> int:
+def launch_simulation(
+    args: argparse.Namespace,
+    deadline_ms: int,
+    plans: list[TaskPlan],
+    schedule_path: Path | None = None,
+) -> int:
     run_dir = args.run_dir.resolve()
     scheduler_bin = args.scheduler.resolve()
     origin_bin = args.origin.resolve()
@@ -419,7 +530,14 @@ def launch_simulation(args: argparse.Namespace, deadline_ms: int, plans: list[Ta
 
     run_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    write_static_schedule_file(static_schedule_path, deadline_ms, plans)
+    if schedule_path is None:
+        write_static_schedule_file(static_schedule_path, deadline_ms, plans)
+    else:
+        schedule_path = schedule_path.resolve()
+        if schedule_path != static_schedule_path:
+            shutil.copyfile(schedule_path, static_schedule_path)
+        else:
+            static_schedule_path = schedule_path
 
     for plan in plans:
         link_path = run_dir / plan.name
@@ -524,9 +642,18 @@ def launch_simulation(args: argparse.Namespace, deadline_ms: int, plans: list[Ta
 
 
 def run_requested_actions(args: argparse.Namespace, origin_bin: Path) -> int:
-    if args.task_file is None:
-        raise SimulatorError("task_file is required")
+    if bool(args.task_file) == bool(args.static_schedule):
+        raise SimulatorError("specify exactly one of task_file or --static-schedule")
 
+    if args.static_schedule is not None:
+        schedule_path = args.static_schedule.resolve()
+        deadline_ms, plans = parse_static_schedule_file(schedule_path)
+        print_schedule(deadline_ms, plans, label="static")
+        if args.dry_run:
+            return 0
+        return launch_simulation(args, deadline_ms, plans, schedule_path=schedule_path)
+
+    assert args.task_file is not None
     deadline_ms, tasks = parse_schedule_file(args.task_file)
     plans = build_erf_schedule(deadline_ms, tasks)
     print_schedule(deadline_ms, plans)
@@ -544,6 +671,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="?",
         type=Path,
         help="Input workload file with tokens taskN_runtime@ready",
+    )
+    parser.add_argument(
+        "--static-schedule",
+        type=Path,
+        help=(
+            "Use an existing static schedule file instead of generating one from task_file; "
+            "tasks will be launched according to that schedule"
+        ),
     )
     parser.add_argument(
         "--scheduler",
@@ -610,7 +745,7 @@ def main() -> int:
             raise SimulatorError("--rounds-per-unit must be positive")
 
         origin_bin = args.origin.resolve()
-        if not origin_bin.is_file():
+        if not args.dry_run and not origin_bin.is_file():
             raise SimulatorError(f"Task origin binary not found: {origin_bin}")
         return run_requested_actions(args, origin_bin)
     except SimulatorError as exc:
