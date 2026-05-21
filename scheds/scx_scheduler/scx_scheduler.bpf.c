@@ -10,8 +10,8 @@ UEI_DEFINE(uei);
 
 #define SHARED_DSQ 0
 #define WAIT_DSQ_BASE 0x1000
-#define ISOLATED_START 6
-#define ISOLATED_END 9
+#define ISOLATED_START 0
+#define ISOLATED_END 1
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
 
 struct scheduler_task_name {

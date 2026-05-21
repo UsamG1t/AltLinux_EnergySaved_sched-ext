@@ -20,8 +20,8 @@
 #include "scx_scheduler.bpf.skel.h"
 #include "scx_scheduler_sched.h"
 
-#define ISOLATED_START 6
-#define ISOLATED_END 9
+#define ISOLATED_START 0
+#define ISOLATED_END 1
 #define NR_ISOLATED_CPUS (ISOLATED_END - ISOLATED_START + 1)
 #define MAX_TIME_IN_STATE_STEPS 64
 
