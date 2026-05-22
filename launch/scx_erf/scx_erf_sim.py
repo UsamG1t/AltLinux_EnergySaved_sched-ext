@@ -546,7 +546,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--work-units-per-ms",
         type=int,
-        default=233,
+        default=521,
         help="Work coefficient exported to tasks as TASK_WORK_UNITS_PER_MS",
     )
     parser.add_argument(

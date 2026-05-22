@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEFAULT_WORK_UNITS_PER_MS 233ULL
+#define DEFAULT_WORK_UNITS_PER_MS 521ULL
 #define DEFAULT_ROUNDS_PER_UNIT 256UL
 
 static volatile uint64_t global_sink;

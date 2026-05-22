@@ -482,13 +482,13 @@ def render_svg_axes(parts: list[str], origin_x: float, origin_y: float,
 
     parts.append(
         f'<text x="{plot_x + plot_width / 2:.1f}" y="{origin_y + height - 8:.1f}" '
-        'font-family="sans-serif" font-size="12" text-anchor="middle">Time (s)</text>'
+        'font-family="sans-serif" font-size="12" text-anchor="middle">Время (с)</text>'
     )
     parts.append(
         f'<text x="{origin_x + 16:.1f}" y="{plot_y + plot_height / 2:.1f}" '
         'font-family="sans-serif" font-size="12" text-anchor="middle" '
         f'transform="rotate(-90 {origin_x + 16:.1f} {plot_y + plot_height / 2:.1f})">'
-        'Frequency (MHz)</text>'
+        'Тактовая частота (МГц)</text>'
     )
 
     return plot_x, plot_y, plot_width, plot_height
@@ -607,14 +607,12 @@ def render_svg(rows: list[dict[str, float]], cpus: list[int],
 
     limits = y_limits(values)
     x_limits = compute_x_limits(rows, schedule_by_cpu, cpus, time_range)
-    title = build_figure_title(source_name, time_range, len(cpus), row_specs)
-
     panel_width = 540.0
     panel_height = 320.0
     gap_x = 40.0
     gap_y = 40.0
     margin_x = 40.0
-    top = 70.0
+    top = 40.0
 
     width = margin_x * 2 + len(cpus) * panel_width + max(len(cpus) - 1, 0) * gap_x
     height = top + len(row_specs) * panel_height + max(len(row_specs) - 1, 0) * gap_y + 40.0
@@ -624,8 +622,6 @@ def render_svg(rows: list[dict[str, float]], cpus: list[int],
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" '
         f'viewBox="0 0 {width:.0f} {height:.0f}">',
         '<rect width="100%" height="100%" fill="#f8fafc"/>',
-        f'<text x="{width / 2:.1f}" y="34" font-family="sans-serif" font-size="20" '
-        f'font-weight="bold" text-anchor="middle">{escape(title)}</text>',
     ]
 
     for row_idx, row_spec in enumerate(row_specs):
@@ -742,24 +738,6 @@ def compute_x_limits(rows: list[dict[str, float]],
     return start, end
 
 
-def build_figure_title(source_name: str,
-                       time_range: tuple[float, float] | None,
-                       nr_cpus: int,
-                       row_specs: list[RowSpec]) -> str:
-    if nr_cpus == 1:
-        title = f"{source_name} analysis"
-    else:
-        title = f"{source_name} analysis for selected CPUs"
-
-    if time_range is not None:
-        title += f" ({time_range[0]:g}-{time_range[1]:g} s)"
-
-    if any(row.kind == "schedule" for row in row_specs):
-        title += " with planned schedule"
-
-    return title
-
-
 def plot_rows(rows: list[dict[str, float]], cpus: list[int],
               row_specs: list[RowSpec],
               schedule_by_cpu: dict[int, list[ScheduleEntry]],
@@ -808,12 +786,10 @@ def plot_rows(rows: list[dict[str, float]], cpus: list[int],
 
             ax.set_xlim(*x_limits)
             ax.set_title(f"CPU {cpu} · {row_spec.title}")
-            ax.set_ylabel("Frequency (MHz)")
+            ax.set_ylabel("Тактовая частота (МГц)")
             if row_idx == nrows - 1:
-                ax.set_xlabel("Time (s)")
-
-    fig.suptitle(build_figure_title(source_name, time_range, len(cpus), row_specs))
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+                ax.set_xlabel("Время (с)")
+    fig.tight_layout()
     plt.show()
 
 

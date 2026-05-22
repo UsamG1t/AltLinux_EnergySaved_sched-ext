@@ -28,13 +28,13 @@ STATUS_COLORS = {
 }
 
 STATUS_LABELS = {
-    "good": "all good",
-    "policy_lag": "policy lags, actual freq looks OK",
-    "intercepted_hold": "task was preempted, target frequency held",
-    "intercepted_drop": "task was preempted, frequency dropped to zero",
-    "freq_mismatch": "no interception, but target frequency mismatch",
-    "idle_or_done": "idle or task finished",
-    "unknown": "unknown / not enough data",
+    "good": "всё в порядке",
+    "policy_lag": "policy отстаёт, фактическая частота корректна",
+    "intercepted_hold": "задача вытеснена, частота удержана",
+    "intercepted_drop": "задача вытеснена, частота сброшена",
+    "freq_mismatch": "перехвата нет, но частота не соответствует цели",
+    "idle_or_done": "простой или завершение задачи",
+    "unknown": "недостаточно данных",
 }
 
 METRIC_COLORS = {
@@ -230,8 +230,19 @@ def event_annotation_text(state: CpuSample, status: str) -> str | None:
     if status == "intercepted_drop":
         return f"{state.actor_name}/{state.actor_pid}"
     if status == "freq_mismatch":
-        return f"step {state.step_idx}"
+        return f"ступень {state.step_idx}"
     return None
+
+
+def present_status_keys(samples: list[Sample], cpus: list[int]) -> list[str]:
+    seen = set()
+
+    for sample in samples:
+        for cpu in cpus:
+            status = classify_sample(sample.cpus.get(cpu, CpuSample()))
+            seen.add(status)
+
+    return [key for key in STATUS_COLORS if key in seen]
 
 
 def svg_output_path(path: Path) -> Path:
@@ -352,9 +363,11 @@ def render_svg_metric_legend(parts: list[str], entries: list[tuple[str, str, str
         cursor_x += 120
 
 
-def render_svg_status_legend(parts: list[str], x0: float, y0: float) -> None:
+def render_svg_status_legend(parts: list[str], x0: float, y0: float,
+                             status_keys: list[str]) -> None:
     cursor_x = x0
-    for key, color in STATUS_COLORS.items():
+    for key in status_keys:
+        color = STATUS_COLORS[key]
         parts.append(
             f'<rect x="{cursor_x:.1f}" y="{y0 - 10:.1f}" width="12" height="12" '
             f'fill="{color}" stroke="{color}"/>'
@@ -369,6 +382,7 @@ def render_svg_status_legend(parts: list[str], x0: float, y0: float) -> None:
 def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> Path:
     y_min, y_max = value_limits(samples, cpus)
     dt = sample_interval(samples)
+    status_keys = present_status_keys(samples, cpus)
     time_start = samples[0].time_sec
     time_end = samples[-1].time_sec + dt
     times = [sample.time_sec for sample in samples]
@@ -376,7 +390,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
     col_width = 420.0
     row_heights = (220.0, 180.0, 72.0)
     left_margin = 70.0
-    top_margin = 70.0
+    top_margin = 40.0
     row_gap = 54.0
     col_gap = 36.0
     width = left_margin + len(cpus) * col_width + max(0, len(cpus) - 1) * col_gap + 30.0
@@ -387,9 +401,6 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" '
         f'viewBox="0 0 {width:.0f} {height:.0f}">',
         '<rect width="100%" height="100%" fill="#f8fafc"/>',
-        f'<text x="{width * 0.5:.1f}" y="28" text-anchor="middle" font-size="20" '
-        'font-weight="700" fill="#0f172a">'
-        f'{escape("Scheduler debug analysis: " + path.name)}</text>',
     ]
 
     render_svg_metric_legend(
@@ -403,7 +414,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
         left_margin,
         48.0,
     )
-    render_svg_status_legend(parts, left_margin, height - 18.0)
+    render_svg_status_legend(parts, left_margin, height - 18.0, status_keys)
 
     for col, cpu in enumerate(cpus):
         panel_x = left_margin + col * (col_width + col_gap)
@@ -438,7 +449,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
 
         render_svg_axes(parts, panel_x, freq_y, col_width, row_heights[0],
                         time_start, time_end, y_min, y_max,
-                        f"CPU {cpu}: observed", "Observed MHz")
+                        f"CPU {cpu}: наблюдаемые частоты", "Тактовая частота (МГц)")
         render_svg_series(parts, times, policy_vals,
                           x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
                           t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
@@ -454,7 +465,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
 
         render_svg_axes(parts, panel_x, target_y, col_width, row_heights[1],
                         time_start, time_end, y_min, y_max,
-                        f"CPU {cpu}: target + events", "Target MHz")
+                        f"CPU {cpu}: цель и события", "Целевая частота (МГц)")
         render_svg_series(parts, times, target_vals,
                           x0=panel_x, y0=target_y, width=col_width, height=row_heights[1],
                           t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
@@ -473,7 +484,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
 
         render_svg_axes(parts, panel_x, status_y, col_width, row_heights[2],
                         time_start, time_end, 0.0, 1.0,
-                        f"CPU {cpu}: state ribbon", "State")
+                        f"CPU {cpu}: состояния", "Состояние")
         for idx, status in enumerate(statuses):
             start = times[idx]
             end = times[idx + 1] if idx + 1 < len(times) else start + dt
@@ -500,6 +511,7 @@ def plot_dbg_log(path: Path) -> None:
 
     y_min, y_max = value_limits(samples, cpus)
     dt = sample_interval(samples)
+    status_keys = present_status_keys(samples, cpus)
     time_start = samples[0].time_sec
     time_end = samples[-1].time_sec
     times = [sample.time_sec for sample in samples]
@@ -518,8 +530,8 @@ def plot_dbg_log(path: Path) -> None:
     )
 
     legend_handles = [
-        Patch(facecolor=color, edgecolor=color, label=STATUS_LABELS[key])
-        for key, color in STATUS_COLORS.items()
+        Patch(facecolor=STATUS_COLORS[key], edgecolor=STATUS_COLORS[key], label=STATUS_LABELS[key])
+        for key in status_keys
     ]
 
     for col, cpu in enumerate(cpus):
@@ -560,7 +572,7 @@ def plot_dbg_log(path: Path) -> None:
         ax_freq.set_ylim(y_min, y_max)
         ax_freq.grid(True, linestyle="--", alpha=0.45)
         ax_freq.set_title(f"CPU {cpu}")
-        ax_freq.set_ylabel("Observed MHz")
+        ax_freq.set_ylabel("Тактовая частота (МГц)")
         ax_freq.legend(loc="upper right", fontsize=8)
 
         ax_target.step(times, target_vals, where="post", color=METRIC_COLORS["target"],
@@ -580,12 +592,12 @@ def plot_dbg_log(path: Path) -> None:
             )
         ax_target.set_ylim(y_min, y_max)
         ax_target.grid(True, linestyle="--", alpha=0.45)
-        ax_target.set_ylabel("Target MHz")
+        ax_target.set_ylabel("Целевая частота (МГц)")
         ax_target.legend(loc="upper right", fontsize=8)
 
         ax_status.set_ylim(0.0, 1.0)
         ax_status.set_yticks([])
-        ax_status.set_ylabel("State")
+        ax_status.set_ylabel("Состояние")
         ax_status.grid(False)
 
         for idx, status in enumerate(statuses):
@@ -595,20 +607,22 @@ def plot_dbg_log(path: Path) -> None:
             else:
                 end = start + dt
 
-            ax_status.axvspan(start, end, color=STATUS_COLORS[status], alpha=0.88)
+        ax_status.axvspan(start, end, color=STATUS_COLORS[status], alpha=0.88)
 
         ax_status.set_xlim(time_start, time_end + dt)
-        ax_status.set_xlabel("Time (s)")
+        ax_status.set_xlabel("Время (с)")
 
-    fig.suptitle(f"Scheduler debug analysis: {path.name}")
-    fig.legend(
-        handles=legend_handles,
-        loc="upper center",
-        ncol=min(len(legend_handles), 3),
-        fontsize=9,
-        bbox_to_anchor=(0.5, 0.98),
-    )
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93))
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="upper center",
+            ncol=min(len(legend_handles), 3),
+            fontsize=9,
+            bbox_to_anchor=(0.5, 0.98),
+        )
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    else:
+        fig.tight_layout()
 
     output_path = path.with_suffix(".analysis.svg")
     fig.savefig(output_path)
