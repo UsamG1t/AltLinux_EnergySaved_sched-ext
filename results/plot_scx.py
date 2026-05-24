@@ -188,6 +188,9 @@ def build_row_specs(available_metrics: tuple[str, ...],
                     have_schedule: bool) -> list[RowSpec]:
     row_specs: list[RowSpec] = []
 
+    if have_schedule:
+        row_specs.append(RowSpec("schedule", "planned schedule"))
+
     if main_mode:
         row_specs.append(RowSpec("metrics", "policy_step(time_in_state)", ("policy",)))
         row_specs.append(RowSpec("metrics", "scaling_cur_freq", ("scaling",)))
@@ -198,9 +201,6 @@ def build_row_specs(available_metrics: tuple[str, ...],
             RowSpec("metrics", METRIC_LABELS[select_default_metrics(available_metrics)[0]],
                     select_default_metrics(available_metrics))
         )
-
-    if have_schedule:
-        row_specs.append(RowSpec("schedule", "planned schedule"))
 
     return row_specs
 
