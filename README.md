@@ -7,10 +7,12 @@ Based on https://github.com/sched-ext/scx, C/eBPF schedulers with frequency mana
 - `scheds/scx_stairs` — `scx_stairs` scheduler sources.
 - `scheds/scx_erf` — `scx_erf` scheduler sources.
 - `scheds/scx_scheduler` — `scx_scheduler` scheduler sources.
+- `scheds/scx_borders` — `scx_borders` scheduler sources.
 - `launch/common` — shared launch assets and common task workload source.
 - `launch/scx_stairs` — `scx_stairs` launch helpers.
 - `launch/scx_erf` — `scx_erf` simulator.
 - `launch/scx_scheduler` — `scx_scheduler` simulator.
+- `launch/scx_borders` — `scx_borders` simulator.
 - `build` — generated binaries, BPF objects, skeletons and temporary run directories.
 - `results` — experiment outputs and plotting tools.
 
@@ -20,11 +22,22 @@ Based on https://github.com/sched-ext/scx, C/eBPF schedulers with frequency mana
 make scx_stairs
 make scx_erf
 make scx_scheduler
+make scx_borders
 make fixed_cpuperf
 make task_workload_origin
 ```
 
 The build products are written to `build/<name>`.
+
+`scx_borders` is a separate scheduler with its own simulator and static
+schedule format. Its schedule stores frequency values directly and does not use
+`perf_target`; task frequencies are applied from user space by updating
+`scaling_min_freq` and `scaling_max_freq`.
+
+```bash
+python3 launch/scx_borders/scx_borders_sim.py \
+  launch/common/test_schedule.txt
+```
 
 ## `scx_scheduler`: calibration and run cycle
 

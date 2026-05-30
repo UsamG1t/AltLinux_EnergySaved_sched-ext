@@ -7,12 +7,15 @@ results/*
 !results/scx_stairs/
 !results/scx_erf/
 !results/scx_scheduler/
+!results/scx_borders/
 results/scx_stairs/*
 !results/scx_stairs/.gitkeep
 results/scx_erf/*
 !results/scx_erf/.gitkeep
 results/scx_scheduler/*
 !results/scx_scheduler/.gitkeep
+results/scx_borders/*
+!results/scx_borders/.gitkeep
 
 __pycache__/
 *.pyc

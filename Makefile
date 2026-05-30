@@ -39,7 +39,7 @@ LIB_OBJ_DIR := $(ROOT_SRC_DIR)/build/lib
 COMMON_OBJ_DIR := $(ROOT_SRC_DIR)/build/common
 COMMON_CFLAGS := -O2 -std=c11 -Wall -Wextra -pedantic
 
-SCHEDULERS := scx_stairs scx_erf scx_scheduler fixed_cpuperf
+SCHEDULERS := scx_stairs scx_erf scx_scheduler scx_borders fixed_cpuperf
 
 .PHONY: all clean install lib common $(SCHEDULERS) task_workload_origin
 
@@ -99,4 +99,5 @@ clean:
 		$(ROOT_SRC_DIR)/build/scx_stairs \
 		$(ROOT_SRC_DIR)/build/scx_erf \
 		$(ROOT_SRC_DIR)/build/scx_scheduler \
+		$(ROOT_SRC_DIR)/build/scx_borders \
 		$(ROOT_SRC_DIR)/build/fixed_cpuperf
