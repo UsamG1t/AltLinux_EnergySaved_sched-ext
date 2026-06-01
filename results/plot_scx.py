@@ -192,15 +192,19 @@ def build_row_specs(available_metrics: tuple[str, ...],
         row_specs.append(RowSpec("schedule", "planned schedule"))
 
     if main_mode:
-        row_specs.append(RowSpec("metrics", "policy_step(time_in_state)", ("policy",)))
-        row_specs.append(RowSpec("metrics", "scaling_cur_freq", ("scaling",)))
+        if "policy" in available_metrics:
+            row_specs.append(RowSpec("metrics", "policy_step(time_in_state)", ("policy",)))
+        if "scaling" in available_metrics:
+            row_specs.append(RowSpec("metrics", "scaling_cur_freq", ("scaling",)))
     elif debug_mode:
-        row_specs.append(RowSpec("metrics", "observed frequencies", available_metrics))
+        if available_metrics:
+            row_specs.append(RowSpec("metrics", "observed frequencies", available_metrics))
     else:
-        row_specs.append(
-            RowSpec("metrics", METRIC_LABELS[select_default_metrics(available_metrics)[0]],
-                    select_default_metrics(available_metrics))
-        )
+        selected_metrics = select_default_metrics(available_metrics)
+        if selected_metrics:
+            row_specs.append(
+                RowSpec("metrics", METRIC_LABELS[selected_metrics[0]], selected_metrics)
+            )
 
     return row_specs
 
@@ -226,15 +230,21 @@ def parse_schedule_file(path: Path) -> dict[int, list[ScheduleEntry]]:
                 continue
 
             parts = line.split()
-            if len(parts) < 10:
+            if len(parts) == 10:
+                start_idx = 8
+                duration_idx = 9
+            elif len(parts) == 9:
+                start_idx = 7
+                duration_idx = 8
+            else:
                 raise ValueError(f"invalid schedule line: {raw_line.rstrip()}")
 
             task_id = int(parts[0])
             cpu = int(parts[3])
             step_idx = int(parts[4])
             freq_khz = int(parts[5])
-            start_ns = int(parts[8])
-            duration_ns = int(parts[9])
+            start_ns = int(parts[start_idx])
+            duration_ns = int(parts[duration_idx])
 
             entry = ScheduleEntry(
                 task_id=task_id,
@@ -295,6 +305,14 @@ def finite_metric_values(rows: list[dict[str, float]], cpus: list[int],
                     values.append(value)
 
     return values
+
+
+def metrics_with_finite_values(rows: list[dict[str, float]], cpus: list[int],
+                               metrics: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        metric for metric in metrics
+        if finite_metric_values(rows, cpus, (metric,))
+    )
 
 
 def finite_schedule_values(schedule_by_cpu: dict[int, list[ScheduleEntry]],
@@ -874,6 +892,9 @@ def main() -> int:
         rows = filter_rows(rows, time_range)
         if not rows:
             raise ValueError("no samples in the selected time range")
+        available_metrics = metrics_with_finite_values(
+            rows, selected_cpus, available_metrics
+        )
 
         raw_schedule = parse_schedule_file(schedule_path) if schedule_path else {}
         schedule_by_cpu = filter_schedule(raw_schedule, selected_cpus, time_range)

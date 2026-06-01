@@ -12,7 +12,7 @@ SAMPLE_CPU_RE = re.compile(
     r"cpu(\d+)=\s*(n/a|[0-9.]+)\|\s*(n/a|[0-9.]+)/(n/a|[0-9.]+)MHz"
 )
 DBG_CPU_RE = re.compile(
-    r"cpu(\d+)\[ev=(\S+)\s+perf=(\d+)\s+task=(\d+)\s+step=(\d+)\s+freq=(\d+)\s+"
+    r"cpu(\d+)\[ev=(\S+)\s+(?:perf|border_khz)=(\d+)\s+task=(\d+)\s+step=(\d+)\s+freq=(\d+)\s+"
     r"actor=(\S+)\s+plan=(\S+)\s+hits=(\d+)/(\d+)\s+keep=(\d+)\s+set=(\d+)\s+"
     r"z=(\d+)/(\d+)/(\d+)\]"
 )
@@ -51,7 +51,7 @@ class CpuSample:
     scaling_mhz: float = math.nan
     avg_mhz: float = math.nan
     event: str = "-"
-    perf_target: int = 0
+    request_value: int = 0
     task_id: int = 0
     step_idx: int = 0
     target_mhz: float = 0.0
@@ -129,7 +129,7 @@ def parse_log(path: Path) -> tuple[list[int], list[Sample]]:
 
                     state = pending.cpus.setdefault(cpu, CpuSample())
                     state.event = dbg_match.group(2)
-                    state.perf_target = int(dbg_match.group(3))
+                    state.request_value = int(dbg_match.group(3))
                     state.task_id = int(dbg_match.group(4))
                     state.step_idx = int(dbg_match.group(5))
                     state.target_mhz = int(dbg_match.group(6)) / 1000.0
@@ -163,7 +163,7 @@ def classify_sample(sample: CpuSample) -> str:
         return "intercepted_hold"
     if sample.event == "run0":
         return "intercepted_drop"
-    if sample.event in {"idle0", "stop0"} or sample.perf_target == 0:
+    if sample.event in {"idle0", "stop0"} or sample.request_value == 0:
         return "idle_or_done"
     if sample.event != "plan" or sample.target_mhz <= 0.0:
         return "unknown"
@@ -283,6 +283,25 @@ def finite_segments(times: list[float], values: list[float]) -> list[list[tuple[
     return segments
 
 
+def has_finite_values(values: list[float]) -> bool:
+    return any(math.isfinite(value) for value in values)
+
+
+def present_frequency_metrics(samples: list[Sample], cpus: list[int]) -> list[str]:
+    metrics = []
+    for metric in ("policy", "scaling", "avg"):
+        values = []
+        for sample in samples:
+            for cpu in cpus:
+                state = sample.cpus.get(cpu)
+                if state is None:
+                    continue
+                values.append(getattr(state, f"{metric}_mhz"))
+        if has_finite_values(values):
+            metrics.append(metric)
+    return metrics
+
+
 def render_svg_axes(parts: list[str], x0: float, y0: float, width: float, height: float,
                     t_min: float, t_max: float, v_min: float, v_max: float,
                     title: str, y_label: str) -> None:
@@ -386,6 +405,15 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
     time_start = samples[0].time_sec
     time_end = samples[-1].time_sec + dt
     times = [sample.time_sec for sample in samples]
+    present_metrics = present_frequency_metrics(samples, cpus)
+    metric_legend_entries = []
+    if "policy" in present_metrics:
+        metric_legend_entries.append(("policy(time_in_state)", METRIC_COLORS["policy"], None))
+    if "scaling" in present_metrics:
+        metric_legend_entries.append(("scaling_cur_freq", METRIC_COLORS["scaling"], "8 4"))
+    if "avg" in present_metrics:
+        metric_legend_entries.append(("cpuinfo_avg_freq", METRIC_COLORS["avg"], "2 3"))
+    metric_legend_entries.append(("planned target MHz", METRIC_COLORS["target"], None))
 
     col_width = 420.0
     row_heights = (220.0, 180.0, 72.0)
@@ -405,12 +433,7 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
 
     render_svg_metric_legend(
         parts,
-        [
-            ("policy(time_in_state)", METRIC_COLORS["policy"], None),
-            ("scaling_cur_freq", METRIC_COLORS["scaling"], "8 4"),
-            ("cpuinfo_avg_freq", METRIC_COLORS["avg"], "2 3"),
-            ("planned target MHz", METRIC_COLORS["target"], None),
-        ],
+        metric_legend_entries,
         left_margin,
         48.0,
     )
@@ -450,18 +473,21 @@ def render_svg_fallback(path: Path, cpus: list[int], samples: list[Sample]) -> P
         render_svg_axes(parts, panel_x, freq_y, col_width, row_heights[0],
                         time_start, time_end, y_min, y_max,
                         f"CPU {cpu}: наблюдаемые частоты", "Тактовая частота (МГц)")
-        render_svg_series(parts, times, policy_vals,
-                          x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
-                          t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
-                          color=METRIC_COLORS["policy"], stroke_width=2.1)
-        render_svg_series(parts, times, scaling_vals,
-                          x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
-                          t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
-                          color=METRIC_COLORS["scaling"], stroke_width=1.9, dasharray="8 4")
-        render_svg_series(parts, times, avg_vals,
-                          x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
-                          t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
-                          color=METRIC_COLORS["avg"], stroke_width=1.8, dasharray="2 3")
+        if has_finite_values(policy_vals):
+            render_svg_series(parts, times, policy_vals,
+                              x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
+                              t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
+                              color=METRIC_COLORS["policy"], stroke_width=2.1)
+        if has_finite_values(scaling_vals):
+            render_svg_series(parts, times, scaling_vals,
+                              x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
+                              t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
+                              color=METRIC_COLORS["scaling"], stroke_width=1.9, dasharray="8 4")
+        if has_finite_values(avg_vals):
+            render_svg_series(parts, times, avg_vals,
+                              x0=panel_x, y0=freq_y, width=col_width, height=row_heights[0],
+                              t_min=time_start, t_max=time_end, v_min=y_min, v_max=y_max,
+                              color=METRIC_COLORS["avg"], stroke_width=1.8, dasharray="2 3")
 
         render_svg_axes(parts, panel_x, target_y, col_width, row_heights[1],
                         time_start, time_end, y_min, y_max,
@@ -563,17 +589,21 @@ def plot_dbg_log(path: Path) -> None:
                     labels_to_draw.append((sample.time_sec, state.target_mhz, text, status))
             prev_status = status
 
-        ax_freq.step(times, policy_vals, where="post", color=METRIC_COLORS["policy"],
-                     linewidth=2.0, label="policy(time_in_state)")
-        ax_freq.step(times, scaling_vals, where="post", color=METRIC_COLORS["scaling"],
-                     linewidth=1.9, linestyle="--", label="scaling_cur_freq")
-        ax_freq.step(times, avg_vals, where="post", color=METRIC_COLORS["avg"],
-                     linewidth=1.8, linestyle=":", label="cpuinfo_avg_freq")
+        if has_finite_values(policy_vals):
+            ax_freq.step(times, policy_vals, where="post", color=METRIC_COLORS["policy"],
+                         linewidth=2.0, label="policy(time_in_state)")
+        if has_finite_values(scaling_vals):
+            ax_freq.step(times, scaling_vals, where="post", color=METRIC_COLORS["scaling"],
+                         linewidth=1.9, linestyle="--", label="scaling_cur_freq")
+        if has_finite_values(avg_vals):
+            ax_freq.step(times, avg_vals, where="post", color=METRIC_COLORS["avg"],
+                         linewidth=1.8, linestyle=":", label="cpuinfo_avg_freq")
         ax_freq.set_ylim(y_min, y_max)
         ax_freq.grid(True, linestyle="--", alpha=0.45)
         ax_freq.set_title(f"CPU {cpu}")
         ax_freq.set_ylabel("Тактовая частота (МГц)")
-        ax_freq.legend(loc="upper right", fontsize=8)
+        if ax_freq.get_legend_handles_labels()[0]:
+            ax_freq.legend(loc="upper right", fontsize=8)
 
         ax_target.step(times, target_vals, where="post", color=METRIC_COLORS["target"],
                        linewidth=2.2, label="planned target MHz")
@@ -607,7 +637,7 @@ def plot_dbg_log(path: Path) -> None:
             else:
                 end = start + dt
 
-        ax_status.axvspan(start, end, color=STATUS_COLORS[status], alpha=0.88)
+            ax_status.axvspan(start, end, color=STATUS_COLORS[status], alpha=0.88)
 
         ax_status.set_xlim(time_start, time_end + dt)
         ax_status.set_xlabel("Время (с)")
