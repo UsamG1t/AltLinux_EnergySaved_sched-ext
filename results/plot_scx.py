@@ -135,7 +135,9 @@ def metric_field(cpu: int, metric: str) -> str:
     return f"cpu{cpu}_{metric}_mhz"
 
 
-def parse_float_or_nan(value: str) -> float:
+def parse_float_or_nan(value: str | None) -> float:
+    if value is None:
+        return math.nan
     text = value.strip()
     if not text or text.lower() in {"none", "nan"}:
         return math.nan
@@ -193,7 +195,15 @@ def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], tuple[str, ..
         rapl_domains = find_rapl_domains(reader.fieldnames)
 
         for raw_row in reader:
-            row = {"elapsed_sec": float(raw_row["elapsed_sec"])}
+            elapsed_text = raw_row.get("elapsed_sec")
+            if not elapsed_text:
+                continue
+            try:
+                elapsed_sec = float(elapsed_text)
+            except ValueError:
+                continue
+
+            row = {"elapsed_sec": elapsed_sec}
             for cpu in cpus:
                 for metric in metrics:
                     field = columns[cpu].get(metric)
@@ -323,14 +333,32 @@ def filter_rows(rows: list[dict[str, float]],
     return [row for row in rows if start <= row["elapsed_sec"] <= end]
 
 
-def parse_schedule_file(path: Path) -> dict[int, list[ScheduleEntry]]:
+def parse_schedule_file(
+    path: Path,
+) -> tuple[float, dict[int, list[ScheduleEntry]]]:
+    period_sec: float | None = None
     schedule_by_cpu: dict[int, list[ScheduleEntry]] = {}
 
     with path.open("r", encoding="utf-8") as file:
-        for raw_line in file:
+        for line_no, raw_line in enumerate(file, 1):
             line = raw_line.split("#", 1)[0].strip()
             if not line:
                 continue
+
+            if line.startswith("deadline_ms"):
+                parts = line.replace(":", " ").replace("=", " ").split()
+                if len(parts) != 2:
+                    raise ValueError(
+                        f"{path}:{line_no}: invalid deadline_ms line"
+                    )
+                period_ms = int(parts[1])
+                if period_ms <= 0:
+                    raise ValueError(
+                        f"{path}:{line_no}: deadline_ms must be positive"
+                    )
+                period_sec = period_ms / 1000.0
+                continue
+
             if not line[0].isdigit():
                 continue
 
@@ -364,7 +392,45 @@ def parse_schedule_file(path: Path) -> dict[int, list[ScheduleEntry]]:
     for cpu_entries in schedule_by_cpu.values():
         cpu_entries.sort(key=lambda entry: (entry.start_sec, entry.end_sec, entry.task_id))
 
-    return schedule_by_cpu
+    if period_sec is None:
+        raise ValueError(f"{path}: schedule is missing deadline_ms")
+
+    return period_sec, schedule_by_cpu
+
+
+def repeat_schedule(
+    schedule_by_cpu: dict[int, list[ScheduleEntry]],
+    period_sec: float,
+    execution_start: float,
+    execution_end: float,
+) -> dict[int, list[ScheduleEntry]]:
+    repeated: dict[int, list[ScheduleEntry]] = {
+        cpu: [] for cpu in schedule_by_cpu
+    }
+    first_cycle = max(0, math.floor(execution_start / period_sec))
+    last_cycle = max(first_cycle, math.floor(execution_end / period_sec))
+
+    for cpu, entries in schedule_by_cpu.items():
+        for cycle_index in range(first_cycle, last_cycle + 1):
+            offset = cycle_index * period_sec
+            for entry in entries:
+                start_sec = entry.start_sec + offset
+                end_sec = entry.end_sec + offset
+                if end_sec <= execution_start or start_sec >= execution_end:
+                    continue
+
+                repeated[cpu].append(
+                    ScheduleEntry(
+                        task_id=entry.task_id,
+                        cpu=entry.cpu,
+                        freq_mhz=entry.freq_mhz,
+                        start_sec=max(start_sec, execution_start),
+                        end_sec=min(end_sec, execution_end),
+                        step_idx=entry.step_idx,
+                    )
+                )
+
+    return repeated
 
 
 def filter_schedule(schedule_by_cpu: dict[int, list[ScheduleEntry]],
@@ -1165,7 +1231,9 @@ def main() -> int:
 
     try:
         time_range = parse_time_range(args.time_range) if args.time_range else None
-        available_cpus, available_metrics, rapl_domains, rows = load_log_rows(log_path)
+        available_cpus, available_metrics, rapl_domains, all_rows = load_log_rows(log_path)
+        if not all_rows:
+            raise ValueError("log file has no samples")
         if args.power and not rapl_domains:
             raise ValueError(f"log file has no RAPL columns: {log_path}")
         selected_cpus = (
@@ -1174,7 +1242,11 @@ def main() -> int:
             else available_cpus
         )
 
-        rows = filter_rows(rows, time_range)
+        execution_start = all_rows[0]["elapsed_sec"]
+        execution_end = all_rows[-1]["elapsed_sec"]
+        execution_duration = execution_end
+
+        rows = filter_rows(all_rows, time_range)
         if not rows:
             raise ValueError("no samples in the selected time range")
         available_metrics = metrics_with_finite_values(
@@ -1182,7 +1254,17 @@ def main() -> int:
         )
         rapl_domains = rapl_domains_with_data(rows, rapl_domains)
 
-        raw_schedule = parse_schedule_file(schedule_path) if schedule_path else {}
+        raw_schedule: dict[int, list[ScheduleEntry]] = {}
+        if schedule_path:
+            period_sec, raw_schedule = parse_schedule_file(schedule_path)
+            if execution_duration >= 3.0 * period_sec:
+                raw_schedule = repeat_schedule(
+                    raw_schedule,
+                    period_sec,
+                    execution_start,
+                    execution_end,
+                )
+
         schedule_by_cpu = filter_schedule(raw_schedule, selected_cpus, time_range)
         row_specs = build_row_specs(
             available_metrics,

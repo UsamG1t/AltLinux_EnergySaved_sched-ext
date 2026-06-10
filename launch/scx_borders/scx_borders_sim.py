@@ -311,7 +311,32 @@ def find_step_for_required_khz(required_khz: int) -> tuple[int, int] | None:
     return None
 
 
-def choose_task_frequency(plan: TaskPlan, window_ns: int) -> None:
+def maximum_frequency_step() -> tuple[int, int]:
+    step = max(FREQ_STEPS, key=lambda item: item[1])
+    if step[1] != MAX_FREQ_KHZ:
+        raise SimulatorError(
+            f"MAX_FREQ_KHZ={MAX_FREQ_KHZ} does not match the highest "
+            f"FREQ_STEPS frequency {step[1]}"
+        )
+    return step
+
+
+def choose_task_frequency(
+    plan: TaskPlan, window_ns: int, max_frequency: bool = False
+) -> None:
+    if max_frequency:
+        step_idx, freq_khz = maximum_frequency_step()
+        duration_ns = task_duration_ns(plan.runtime_ms, freq_khz)
+        if duration_ns > window_ns:
+            raise SimulatorError(
+                f"Task {plan.name} cannot fit into its ERF window "
+                "even at maximum frequency"
+            )
+        plan.freq_step_idx = step_idx
+        plan.freq_khz = freq_khz
+        plan.duration_ns = duration_ns
+        return
+
     required_khz = ceil_div(plan.runtime_ms * MAX_FREQ_KHZ * 1_000_000, window_ns)
     initial_step = find_step_for_required_khz(required_khz)
     if initial_step is None:
@@ -331,7 +356,9 @@ def choose_task_frequency(plan: TaskPlan, window_ns: int) -> None:
     raise SimulatorError(f"Task {plan.name} cannot fit into its ERF window")
 
 
-def build_erf_schedule(deadline_ms: int, tasks: list[TaskInput]) -> list[TaskPlan]:
+def build_erf_schedule(
+    deadline_ms: int, tasks: list[TaskInput], max_frequency: bool = False
+) -> list[TaskPlan]:
     sorted_tasks = sorted(tasks, key=lambda task: (task.ready_ms, -task.runtime_ms, task.task_id))
     cpu_states: list[dict[str, int]] = [
         {
@@ -377,18 +404,29 @@ def build_erf_schedule(deadline_ms: int, tasks: list[TaskInput]) -> list[TaskPla
             boundary_ns = plans[idx + 1].start_ns
         if boundary_ns <= plan.start_ns:
             raise SimulatorError(f"Invalid ERF window for {plan.name}")
-        choose_task_frequency(plan, apply_schedule_slack(boundary_ns - plan.start_ns))
+        choose_task_frequency(
+            plan,
+            apply_schedule_slack(boundary_ns - plan.start_ns),
+            max_frequency=max_frequency,
+        )
 
     return plans
 
 
-def print_schedule(deadline_ms: int, plans: Iterable[TaskPlan], label: str = "ERF") -> None:
+def print_schedule(
+    deadline_ms: int,
+    plans: Iterable[TaskPlan],
+    label: str = "ERF",
+    max_frequency: bool = False,
+) -> None:
     sorted_plans = sorted(plans, key=lambda plan: (plan.cpu, plan.order))
     print(
         f"Loaded {label} schedule for {len(sorted_plans)} tasks, deadline {deadline_ms:.3f} ms"
     )
     if label == "ERF":
         print(f"Per-task slack reserve: {ERF_SLACK_PCT}% of each scheduling window")
+        if max_frequency:
+            print(f"Frequency mode: maximum ({MAX_FREQ_KHZ} kHz)")
     for idx, plan in enumerate(sorted_plans):
         if idx == 0 or sorted_plans[idx - 1].cpu != plan.cpu:
             print(f"CPU{plan.cpu}")
@@ -454,12 +492,20 @@ class BordersOutputWatcher:
     def _run(self) -> None:
         with self.log_path.open("w", encoding="utf-8") as log:
             assert self.proc.stdout is not None
+            next_sync = time.monotonic() + 1.0
             for raw_line in self.proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace")
                 sys.stdout.write(line)
                 log.write(line)
+                log.flush()
+                now = time.monotonic()
+                if now >= next_sync:
+                    os.fsync(log.fileno())
+                    next_sync = now + 1.0
                 if any(marker in line for marker in READY_MARKERS):
                     self.ready.set()
+            log.flush()
+            os.fsync(log.fileno())
         self.done.set()
 
 
@@ -488,7 +534,7 @@ def launch_simulation(
     origin_bin = args.origin.resolve()
     log_dir = run_dir / "logs"
     static_schedule_path = run_dir / "static_schedule.txt"
-    task_procs: list[subprocess.Popen[bytes]] = []
+    task_procs: list[tuple[subprocess.Popen[bytes], TaskPlan, int]] = []
     task_links: list[Path] = []
     borders_proc: subprocess.Popen[bytes] | None = None
 
@@ -519,8 +565,10 @@ def launch_simulation(
         str(borders_bin),
         "-f",
         str(args.sample_interval),
-        str(static_schedule_path),
     ]
+    if args.loop:
+        borders_cmd.append("-l")
+    borders_cmd.append(str(static_schedule_path))
     print("Starting scx_borders:", " ".join(borders_cmd))
     print(f"Static schedule written to {static_schedule_path}")
     borders_proc = subprocess.Popen(
@@ -545,42 +593,78 @@ def launch_simulation(
 
     start_monotonic = time.monotonic()
     release_plans = sorted(plans, key=lambda plan: (plan.ready_ms, plan.start_ns, plan.cpu, plan.order))
+    period_sec = deadline_ms / 1000.0
 
-    try:
-        for plan in release_plans:
-            if borders_proc.poll() is not None:
+    def check_scheduler(context: str) -> None:
+        if borders_proc is not None and borders_proc.poll() is not None:
+            raise SimulatorError(
+                f"Borders exited {context} with rc={borders_proc.returncode}"
+            )
+
+    def reap_finished_tasks() -> None:
+        running: list[tuple[subprocess.Popen[bytes], TaskPlan, int]] = []
+
+        for proc, plan, cycle_index in task_procs:
+            rc = proc.poll()
+            if rc is None:
+                running.append((proc, plan, cycle_index))
+                continue
+            if rc != 0:
+                stderr_data = b""
+                if proc.stderr is not None:
+                    stderr_data = proc.stderr.read()
                 raise SimulatorError(
-                    f"Borders exited early during task release with rc={borders_proc.returncode}"
+                    f"{plan.name} from cycle {cycle_index} exited with rc={rc}\n"
+                    f"{stderr_data.decode('utf-8', errors='replace')}"
                 )
 
-            target_time = start_monotonic + plan.ready_ms / 1000.0
-            while True:
-                now = time.monotonic()
-                remaining = target_time - now
-                if remaining <= 0:
-                    break
-                if borders_proc.poll() is not None:
-                    raise SimulatorError(
-                        f"Borders exited early while waiting for task release with rc={borders_proc.returncode}"
-                    )
-                time.sleep(min(remaining, 0.01))
+        task_procs[:] = running
 
-            task_path = run_dir / plan.name
-            print(
-                f"[+{plan.ready_ms:.3f} ms ready, +{plan.start_ns / 1_000_000:.3f} ms start] "
-                f"launch {plan.name} cpu={plan.cpu} step={plan.freq_step_idx} freq={plan.freq_khz}"
-            )
-            proc = subprocess.Popen(
-                [str(task_path), str(plan.runtime_ms)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                env=env,
-                start_new_session=True,
-            )
-            task_procs.append(proc)
+    def wait_until(target_time: float, context: str) -> None:
+        while True:
+            check_scheduler(context)
+            reap_finished_tasks()
+            remaining = target_time - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.01))
+
+    def launch_task(plan: TaskPlan, cycle_index: int) -> None:
+        task_path = run_dir / plan.name
+        cycle_offset_ms = cycle_index * deadline_ms
+        print(
+            f"[cycle={cycle_index} +{cycle_offset_ms + plan.ready_ms:.3f} ms ready, "
+            f"+{cycle_offset_ms + plan.start_ns / 1_000_000:.3f} ms start] "
+            f"launch {plan.name} cpu={plan.cpu} "
+            f"step={plan.freq_step_idx} freq={plan.freq_khz}"
+        )
+        proc = subprocess.Popen(
+            [str(task_path), str(plan.runtime_ms)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        task_procs.append((proc, plan, cycle_index))
+
+    try:
+        cycle_index = 0
+        while True:
+            if args.loop:
+                print(f"Starting schedule cycle {cycle_index}")
+
+            cycle_start = start_monotonic + cycle_index * period_sec
+            for plan in release_plans:
+                target_time = cycle_start + plan.ready_ms / 1000.0
+                wait_until(target_time, "during task release")
+                launch_task(plan, cycle_index)
+
+            if not args.loop:
+                break
+            cycle_index += 1
 
         failed = False
-        for proc, plan in zip(task_procs, release_plans):
+        for proc, plan, cycle_index in task_procs:
             rc = proc.wait()
             if rc != 0:
                 failed = True
@@ -588,19 +672,17 @@ def launch_simulation(
                 if proc.stderr is not None:
                     stderr_data = proc.stderr.read()
                 sys.stderr.write(
-                    f"{plan.name} exited with rc={rc}\n{stderr_data.decode('utf-8', errors='replace')}"
+                    f"{plan.name} from cycle {cycle_index} exited with rc={rc}\n"
+                    f"{stderr_data.decode('utf-8', errors='replace')}"
                 )
-            if borders_proc.poll() is not None:
-                raise SimulatorError(
-                    f"Borders exited before workload completion with rc={borders_proc.returncode}"
-                )
+            check_scheduler("before workload completion")
 
         if borders_proc.poll() is None:
             terminate_process_tree(borders_proc)
 
         return 1 if failed else 0
     finally:
-        for proc in task_procs:
+        for proc, _, _ in task_procs:
             terminate_process_tree(proc)
         terminate_process_tree(borders_proc)
         for link_path in task_links:
@@ -615,17 +697,29 @@ def run_requested_actions(args: argparse.Namespace) -> int:
         raise SimulatorError("specify exactly one of task_file or --static-schedule")
 
     if args.static_schedule is not None:
+        if args.max_frequency:
+            raise SimulatorError(
+                "--max-frequency cannot be combined with --static-schedule"
+            )
         schedule_path = args.static_schedule.resolve()
         deadline_ms, plans = parse_static_schedule_file(schedule_path)
         print_schedule(deadline_ms, plans, label="static")
+        if args.loop:
+            print(f"Loop mode: enabled, period {deadline_ms:.3f} ms")
         if args.dry_run:
             return 0
         return launch_simulation(args, deadline_ms, plans, schedule_path=schedule_path)
 
     assert args.task_file is not None
     deadline_ms, tasks = parse_schedule_file(args.task_file)
-    plans = build_erf_schedule(deadline_ms, tasks)
-    print_schedule(deadline_ms, plans)
+    plans = build_erf_schedule(
+        deadline_ms, tasks, max_frequency=args.max_frequency
+    )
+    print_schedule(
+        deadline_ms, plans, max_frequency=args.max_frequency
+    )
+    if args.loop:
+        print(f"Loop mode: enabled, period {deadline_ms:.3f} ms")
     if args.dry_run:
         return 0
     return launch_simulation(args, deadline_ms, plans)
@@ -701,6 +795,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Only solve and print the schedule, do not launch anything",
+    )
+    parser.add_argument(
+        "--max-frequency",
+        action="store_true",
+        help=(
+            "Build the generated schedule using the maximum configured "
+            "frequency for every task"
+        ),
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help=(
+            "Repeat the schedule indefinitely, using deadline_ms as the "
+            "period and releasing a new task set every period"
+        ),
     )
     return parser
 

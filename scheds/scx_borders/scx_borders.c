@@ -31,6 +31,7 @@
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define LOG_DBG_PATH LOG_DIR "/dbg.log"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
+#define LOG_SYNC_INTERVAL_NS 1000000000ULL
 #define RAPL_POWERCAP_DIR "/sys/class/powercap"
 #define RAPL_ZONE_PREFIX "intel-rapl:"
 #define MAX_RAPL_DOMAINS 16
@@ -262,6 +263,15 @@ static FILE *open_log_file(const char *path)
 
 	setvbuf(file, NULL, _IOLBF, 0);
 	return file;
+}
+
+static int sync_log_file(FILE *file)
+{
+	if (fflush(file) < 0)
+		return -errno;
+	if (fdatasync(fileno(file)) < 0)
+		return -errno;
+	return 0;
 }
 
 static int read_long_file(const char *path, long *value)
@@ -813,7 +823,7 @@ static void write_csv_header(FILE *csv, const struct rapl_monitor *rapl)
 {
 	int i;
 
-	fprintf(csv, "elapsed_sec");
+	fprintf(csv, "elapsed_sec,cycle_index");
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 		fprintf(csv, ",cpu%d_policy_mhz", isolated_cpus[i]);
 		fprintf(csv, ",cpu%d_scaling_mhz", isolated_cpus[i]);
@@ -838,7 +848,7 @@ static void write_csv_freq_field(FILE *csv, bool valid, double freq_mhz)
 		fprintf(csv, ",None");
 }
 
-static void write_csv_sample(FILE *csv, double elapsed_sec,
+static void write_csv_sample(FILE *csv, double elapsed_sec, __u64 cycle_index,
 			     const bool *policy_valid,
 			     const double *policy_mhz,
 			     const bool *scaling_valid,
@@ -850,7 +860,8 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 {
 	int i;
 
-	fprintf(csv, "%.6f", elapsed_sec);
+	fprintf(csv, "%.6f,%llu", elapsed_sec,
+		(unsigned long long)cycle_index);
 	for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 		write_csv_freq_field(csv, policy_valid[i], policy_mhz[i]);
 		write_csv_freq_field(csv, scaling_valid[i], scaling_mhz[i]);
@@ -1785,8 +1796,10 @@ int main(int argc, char **argv)
 	__u64 ecode;
 	__u64 interval_ns;
 	__u64 next_sample_ns;
+	__u64 next_log_sync_ns;
 	char fail_stage[128] = "startup";
 	int opt;
+	bool loop_enabled = false;
 	int last_timer_sec = -1;
 	int ret = 0;
 
@@ -1800,7 +1813,7 @@ int main(int argc, char **argv)
 	init_cpu_freq_readers(avg_readers);
 	init_freq_border_writers(border_writers);
 
-	while ((opt = getopt(argc, argv, "f:h")) != -1) {
+	while ((opt = getopt(argc, argv, "f:lh")) != -1) {
 		switch (opt) {
 		case 'f':
 			ret = parse_interval(optarg, &sample_interval_sec);
@@ -1810,15 +1823,20 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'l':
+			loop_enabled = true;
+			break;
 		default:
-			fprintf(stderr, "Usage: %s [-f interval_sec] <schedule_file>\n",
+			fprintf(stderr,
+				"Usage: %s [-f interval_sec] [-l] <schedule_file>\n",
 				argv[0]);
 			return opt != 'h';
 		}
 	}
 
 	if (optind >= argc) {
-		fprintf(stderr, "Usage: %s [-f interval_sec] <schedule_file>\n",
+		fprintf(stderr,
+			"Usage: %s [-f interval_sec] [-l] <schedule_file>\n",
 			argv[0]);
 		return 1;
 	}
@@ -1837,7 +1855,7 @@ int main(int argc, char **argv)
 
 	control.deadline_ns = schedule.deadline_ms * 1000000ULL;
 	control.nr_tasks = schedule.nr_plans;
-	control.reserved = 0;
+	control.loop_enabled = loop_enabled;
 
 	ret = disable_boost(&boost);
 	if (ret < 0) {
@@ -1889,6 +1907,20 @@ restart:
 			       "open_log_file(%s)", LOG_DBG_PATH);
 		goto out;
 	}
+	fprintf(dbg, "run: loop=%u period_ns=%llu\n", control.loop_enabled,
+		(unsigned long long)control.deadline_ns);
+	ret = sync_log_file(csv);
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "sync_log_file(csv header)");
+		goto out;
+	}
+	ret = sync_log_file(dbg);
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "sync_log_file(debug header)");
+		goto out;
+	}
 
 	ret = init_monitor_readers(tis_readers, scaling_readers, avg_readers);
 	if (ret < 0) {
@@ -1906,6 +1938,7 @@ restart:
 
 	interval_ns = (__u64)(sample_interval_sec * 1000000000.0);
 	next_sample_ns = timespec_to_ns(&start_ts);
+	next_log_sync_ns = next_sample_ns + LOG_SYNC_INTERVAL_NS;
 
 	print_schedule_summary(schedule.plans, schedule.nr_plans, &control);
 	if (boost.supported)
@@ -1917,6 +1950,9 @@ restart:
 	rapl_print_domains(&rapl);
 	printf("Logging samples to %s\n", LOG_CSV_PATH);
 	printf("Logging debug samples to %s\n", LOG_DBG_PATH);
+	if (control.loop_enabled)
+		printf("Loop mode enabled, period %.3f ms\n",
+		       (double)control.deadline_ns / 1000000.0);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
 		bool policy_valid[NR_ISOLATED_CPUS] = {};
@@ -1928,6 +1964,9 @@ restart:
 		struct borders_debug_cpu_state debug_states[NR_ISOLATED_CPUS] = {};
 		struct timespec now_ts;
 		double elapsed_sec;
+		__u64 elapsed_ns;
+		__u64 cycle_index;
+		__u64 now_ns;
 		int i;
 
 		ret = monotonic_now(&now_ts);
@@ -1937,9 +1976,11 @@ restart:
 			goto out;
 		}
 
-		elapsed_sec =
-			(double)(timespec_to_ns(&now_ts) - timespec_to_ns(&start_ts)) /
-			1000000000.0;
+		now_ns = timespec_to_ns(&now_ts);
+		elapsed_ns = now_ns - timespec_to_ns(&start_ts);
+		elapsed_sec = (double)elapsed_ns / 1000000000.0;
+		cycle_index = control.loop_enabled && control.deadline_ns ?
+			elapsed_ns / control.deadline_ns : 0;
 
 		rapl_sample(&rapl);
 
@@ -1990,10 +2031,27 @@ restart:
 				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
 		write_debug_sample_line(dbg, debug_states);
 		write_rapl_sample_line(dbg, &rapl);
-		write_csv_sample(csv, elapsed_sec, policy_valid, policy_mhz,
+		write_csv_sample(csv, elapsed_sec, cycle_index,
+				 policy_valid, policy_mhz,
 				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
 				 debug_states, &rapl);
 		maybe_print_progress_timer(elapsed_sec, &last_timer_sec);
+
+		if (now_ns >= next_log_sync_ns) {
+			ret = sync_log_file(csv);
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sync_log_file(csv)");
+				goto out;
+			}
+			ret = sync_log_file(dbg);
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sync_log_file(debug)");
+				goto out;
+			}
+			next_log_sync_ns = now_ns + LOG_SYNC_INTERVAL_NS;
+		}
 
 		next_sample_ns += interval_ns;
 		ret = sleep_until_ns(next_sample_ns);
@@ -2009,10 +2067,14 @@ out:
 	close_cpu_freq_readers(scaling_readers);
 	close_cpu_freq_readers(avg_readers);
 	rapl_close(&rapl);
-	if (csv)
+	if (csv) {
+		sync_log_file(csv);
 		fclose(csv);
-	if (dbg)
+	}
+	if (dbg) {
+		sync_log_file(dbg);
 		fclose(dbg);
+	}
 	if (link)
 		bpf_link__destroy(link);
 

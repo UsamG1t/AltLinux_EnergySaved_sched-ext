@@ -22,6 +22,10 @@ struct borders_runtime_state {
 	u64 base_ns;
 };
 
+struct borders_task_runtime {
+	u64 target_start_ns;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BORDERS_MAX_TASKS);
@@ -42,6 +46,13 @@ struct {
 	__type(key, __u32);
 	__type(value, struct borders_runtime_state);
 } borders_runtime SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, BORDERS_MAX_TASKS * 4);
+	__type(key, __u32);
+	__type(value, struct borders_task_runtime);
+} task_runtime SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -251,11 +262,42 @@ static inline u64 task_abs_start_ns(const struct borders_task_plan *plan, u64 ba
 	return base_ns + plan->start_ns;
 }
 
-static inline bool task_start_reached(const struct borders_task_plan *plan, u64 now)
+static inline u64 task_target_start_ns(const struct task_struct *p,
+				       const struct borders_task_plan *plan,
+				       u64 now)
 {
+	struct borders_task_runtime *runtime;
+	struct borders_task_runtime new_runtime = {};
+	struct borders_control *control;
 	u64 base_ns = get_or_init_schedule_base_ns(plan, now);
+	u64 cycle = 0;
+	u32 control_key = 0;
+	u32 pid = p->pid;
 
-	return now >= task_abs_start_ns(plan, base_ns);
+	runtime = bpf_map_lookup_elem(&task_runtime, &pid);
+	if (runtime)
+		return runtime->target_start_ns;
+
+	control = bpf_map_lookup_elem(&borders_control, &control_key);
+	if (control && control->loop_enabled && control->deadline_ns &&
+	    now > base_ns + task_ready_ns(plan))
+		/* Process creation jitter may place an arrival just before its boundary. */
+		cycle = (now - base_ns - task_ready_ns(plan) +
+			 control->deadline_ns / 2) /
+			control->deadline_ns;
+
+	new_runtime.target_start_ns =
+		task_abs_start_ns(plan, base_ns) +
+		cycle * (control ? control->deadline_ns : 0);
+	bpf_map_update_elem(&task_runtime, &pid, &new_runtime, BPF_ANY);
+	return new_runtime.target_start_ns;
+}
+
+static inline bool task_start_reached(const struct task_struct *p,
+				      const struct borders_task_plan *plan,
+				      u64 now)
+{
+	return now >= task_target_start_ns(p, plan, now);
 }
 
 static inline void enqueue_planned_task(struct task_struct *p,
@@ -264,14 +306,14 @@ static inline void enqueue_planned_task(struct task_struct *p,
 {
 	u64 now = scx_bpf_now();
 
-	if (task_start_reached(plan, now)) {
+	if (task_start_reached(p, plan, now)) {
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | plan->cpu, SCX_SLICE_DFL,
 				   enq_flags);
 		return;
 	}
 
 	scx_bpf_dsq_insert_vtime(p, wait_dsq_id_for_cpu(plan->cpu), SCX_SLICE_DFL,
-				 task_abs_start_ns(plan, get_or_init_schedule_base_ns(plan, now)),
+				 task_target_start_ns(p, plan, now),
 				 enq_flags);
 	scx_bpf_kick_cpu(plan->cpu, 0);
 }
@@ -289,7 +331,7 @@ static inline void dispatch_waiting_task(s32 cpu)
 		return;
 
 	now = scx_bpf_now();
-	if (!task_start_reached(&plan, now))
+	if (!task_start_reached(p, &plan, now))
 		return;
 
 	scx_bpf_dsq_move_to_local(wait_dsq_id_for_cpu(cpu));
@@ -458,6 +500,15 @@ void BPF_STRUCT_OPS(borders_update_idle, s32 cpu, bool idle)
 	request_frequency_border(cpu, 0);
 }
 
+void BPF_STRUCT_OPS(borders_exit_task, struct task_struct *p,
+		    struct scx_exit_task_args *args)
+{
+	u32 pid = p->pid;
+
+	(void)args;
+	bpf_map_delete_elem(&task_runtime, &pid);
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(borders_init)
 {
 	const struct cpumask *online = scx_bpf_get_online_cpumask();
@@ -499,6 +550,7 @@ SCX_OPS_DEFINE(borders_ops,
 	       .running			= (void *)borders_running,
 	       .stopping		= (void *)borders_stopping,
 	       .update_idle		= (void *)borders_update_idle,
+	       .exit_task		= (void *)borders_exit_task,
 	       .init			= (void *)borders_init,
 	       .exit			= (void *)borders_exit,
 	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,

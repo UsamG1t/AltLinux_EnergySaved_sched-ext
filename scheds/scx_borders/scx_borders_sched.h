@@ -49,7 +49,7 @@ struct borders_debug_cpu_state {
 struct borders_control {
 	__u64 deadline_ns;
 	__u32 nr_tasks;
-	__u32 reserved;
+	__u32 loop_enabled;
 };
 
 #endif

@@ -39,6 +39,20 @@ python3 launch/scx_borders/scx_borders_sim.py \
   launch/common/test_schedule.txt
 ```
 
+Use `--max-frequency` to assign the maximum configured frequency to every
+generated task. Use `--loop` to repeat the schedule indefinitely; in this mode
+`deadline_ms` is also the period:
+
+```bash
+python3 launch/scx_borders/scx_borders_sim.py \
+  --loop --max-frequency \
+  launch/common/test_schedule.txt
+```
+
+Loop mode also works with `--static-schedule`. `results/scx_borders/latest.csv`
+contains elapsed time and `cycle_index`; `latest.csv` and `dbg.log` are flushed
+and synchronized to disk once per second.
+
 ## `scx_scheduler`: calibration and run cycle
 
 The `scx_scheduler` pipeline has two mandatory calibration stages before the
