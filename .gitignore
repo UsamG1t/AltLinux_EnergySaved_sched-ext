@@ -20,7 +20,5 @@ results/scx_borders/*
 __pycache__/
 *.pyc
 *~
-.codex
-.agents
 .diag_run
 .github/agents/
