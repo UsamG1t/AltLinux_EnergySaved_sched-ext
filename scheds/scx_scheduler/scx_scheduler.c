@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -29,6 +31,32 @@
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define LOG_DBG_PATH LOG_DIR "/dbg.log"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
+#define RAPL_POWERCAP_DIR "/sys/class/powercap"
+#define RAPL_ZONE_PREFIX "intel-rapl:"
+#define MAX_RAPL_DOMAINS 16
+#define RAPL_NAME_LEN 64
+
+struct rapl_domain {
+	int fd;
+	char zone[RAPL_NAME_LEN];
+	char name[RAPL_NAME_LEN];
+	char label[RAPL_NAME_LEN];
+	unsigned long long max_range_uj;
+	unsigned long long prev_uj;
+	unsigned long long total_uj;
+	__u64 start_ns;
+	__u64 prev_ns;
+	bool have_prev;
+	bool read_error_reported;
+	bool power_valid;
+	double power_w;
+};
+
+struct rapl_monitor {
+	struct rapl_domain domains[MAX_RAPL_DOMAINS];
+	size_t nr_domains;
+};
+
 
 struct cpu_freq_reader {
 	int cpu;
@@ -600,7 +628,10 @@ static int read_debug_states(struct scx_scheduler *skel,
 	return 0;
 }
 
-static void write_csv_header(FILE *csv)
+static void write_csv_rapl_header(FILE *csv, const struct rapl_monitor *mon);
+static void write_csv_rapl_sample(FILE *csv, const struct rapl_monitor *mon);
+
+static void write_csv_header(FILE *csv, const struct rapl_monitor *rapl)
 {
 	int i;
 
@@ -617,6 +648,7 @@ static void write_csv_header(FILE *csv)
 			isolated_cpus[i], isolated_cpus[i], isolated_cpus[i],
 			isolated_cpus[i], isolated_cpus[i]);
 	}
+	write_csv_rapl_header(csv, rapl);
 	fprintf(csv, "\n");
 }
 
@@ -635,7 +667,8 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 			     const double *scaling_mhz,
 			     const bool *avg_valid,
 			     const double *avg_mhz,
-			     const struct scheduler_debug_cpu_state *debug_states)
+			     const struct scheduler_debug_cpu_state *debug_states,
+			     const struct rapl_monitor *rapl)
 {
 	int i;
 
@@ -660,6 +693,7 @@ static void write_csv_sample(FILE *csv, double elapsed_sec,
 			(unsigned long long)debug_states[i].zero_from_stopping_hits,
 			(unsigned long long)debug_states[i].zero_from_idle_hits);
 	}
+	write_csv_rapl_sample(csv, rapl);
 	fprintf(csv, "\n");
 }
 
@@ -745,6 +779,350 @@ static void write_debug_sample_line(FILE *out,
 			(unsigned long long)states[i].zero_from_running_hits,
 			(unsigned long long)states[i].zero_from_stopping_hits,
 			(unsigned long long)states[i].zero_from_idle_hits);
+	}
+	fprintf(out, "\n");
+}
+
+static int read_string_file(const char *path, char *buf, size_t size)
+{
+	ssize_t nr_read;
+	int fd;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	nr_read = pread(fd, buf, size - 1, 0);
+	close(fd);
+	if (nr_read <= 0)
+		return nr_read ? -errno : -EIO;
+
+	buf[nr_read] = '\0';
+	buf[strcspn(buf, "\n")] = '\0';
+	return 0;
+}
+
+static int read_ull_fd(int fd, unsigned long long *value)
+{
+	char buf[64];
+	char *endp;
+	ssize_t nr_read;
+	unsigned long long parsed;
+
+	nr_read = pread(fd, buf, sizeof(buf) - 1, 0);
+	if (nr_read <= 0)
+		return nr_read ? -errno : -EIO;
+
+	buf[nr_read] = '\0';
+	errno = 0;
+	parsed = strtoull(buf, &endp, 10);
+	if (errno || endp == buf)
+		return -EINVAL;
+
+	*value = parsed;
+	return 0;
+}
+
+static void rapl_sanitize(const char *src, char *dst, size_t size)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < size && src[i]; i++)
+		dst[i] = isalnum((unsigned char)src[i]) ?
+				 (char)tolower((unsigned char)src[i]) : '_';
+	dst[i] = '\0';
+}
+
+static const struct rapl_domain *rapl_find_zone(const struct rapl_monitor *mon,
+						const char *zone)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		if (!strcmp(mon->domains[i].zone, zone))
+			return &mon->domains[i];
+	}
+
+	return NULL;
+}
+
+static bool rapl_label_used(const struct rapl_monitor *mon, const char *label)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		if (!strcmp(mon->domains[i].label, label))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Column label of a powercap zone: "package-N" -> "pkgN", a subzone
+ * (intel-rapl:A:B) -> "<parent label>_<name>", other zones -> "<name>".
+ */
+static void rapl_make_label(const struct rapl_monitor *mon, struct rapl_domain *dom)
+{
+	const char *suffix = dom->zone + strlen(RAPL_ZONE_PREFIX);
+	const char *sub = strchr(suffix, ':');
+	char name[RAPL_NAME_LEN];
+	char zone_id[RAPL_NAME_LEN];
+
+	rapl_sanitize(dom->name, name, sizeof(name));
+	rapl_sanitize(suffix, zone_id, sizeof(zone_id));
+
+	if (!strncmp(dom->name, "package-", strlen("package-"))) {
+		rapl_sanitize(dom->name + strlen("package-"), name, sizeof(name));
+		snprintf(dom->label, sizeof(dom->label), "pkg%.48s", name);
+	} else if (sub) {
+		char parent_zone[RAPL_NAME_LEN];
+		const struct rapl_domain *parent;
+
+		snprintf(parent_zone, sizeof(parent_zone), "%.*s",
+			 (int)(sub - dom->zone), dom->zone);
+		parent = rapl_find_zone(mon, parent_zone);
+		if (parent)
+			snprintf(dom->label, sizeof(dom->label), "%.24s_%.24s",
+				 parent->label, name);
+		else
+			snprintf(dom->label, sizeof(dom->label), "zone%.24s", zone_id);
+	} else {
+		snprintf(dom->label, sizeof(dom->label), "%s", name);
+	}
+
+	if (rapl_label_used(mon, dom->label)) {
+		char base[RAPL_NAME_LEN];
+
+		snprintf(base, sizeof(base), "%s", dom->label);
+		snprintf(dom->label, sizeof(dom->label), "%.24s_z%.24s", base,
+			 zone_id);
+	}
+}
+
+static int rapl_zone_filter(const struct dirent *entry)
+{
+	return !strncmp(entry->d_name, RAPL_ZONE_PREFIX, strlen(RAPL_ZONE_PREFIX));
+}
+
+static void rapl_close(struct rapl_monitor *mon)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		if (mon->domains[i].fd >= 0) {
+			close(mon->domains[i].fd);
+			mon->domains[i].fd = -1;
+		}
+	}
+}
+
+/*
+ * Discover RAPL powercap zones. Missing RAPL or missing permissions are not
+ * fatal: the run continues and the affected energy/power fields are None.
+ */
+static void rapl_open(struct rapl_monitor *mon)
+{
+	struct dirent **entries = NULL;
+	int nr_entries;
+	int i;
+
+	memset(mon, 0, sizeof(*mon));
+
+	nr_entries = scandir(RAPL_POWERCAP_DIR, &entries, rapl_zone_filter,
+			     alphasort);
+	if (nr_entries < 0) {
+		fprintf(stderr,
+			"Warning: %s is unavailable (%s), RAPL energy will not be logged\n",
+			RAPL_POWERCAP_DIR, strerror(errno));
+		return;
+	}
+
+	for (i = 0; i < nr_entries; i++) {
+		struct rapl_domain *dom;
+		char path[PATH_MAX];
+		long max_range = 0;
+
+		if (mon->nr_domains >= MAX_RAPL_DOMAINS) {
+			fprintf(stderr, "Warning: RAPL zone %s ignored, more than %d zones\n",
+				entries[i]->d_name, MAX_RAPL_DOMAINS);
+			continue;
+		}
+
+		dom = &mon->domains[mon->nr_domains];
+		dom->fd = -1;
+		snprintf(dom->zone, sizeof(dom->zone), "%.48s", entries[i]->d_name);
+
+		snprintf(path, sizeof(path), RAPL_POWERCAP_DIR "/%s/name", dom->zone);
+		if (read_string_file(path, dom->name, sizeof(dom->name)) < 0)
+			memcpy(dom->name, dom->zone, sizeof(dom->name));
+
+		snprintf(path, sizeof(path), RAPL_POWERCAP_DIR "/%s/max_energy_range_uj",
+			 dom->zone);
+		if (read_long_file(path, &max_range) == 0 && max_range > 0)
+			dom->max_range_uj = (unsigned long long)max_range;
+
+		snprintf(path, sizeof(path), RAPL_POWERCAP_DIR "/%s/energy_uj", dom->zone);
+		dom->fd = open(path, O_RDONLY | O_CLOEXEC);
+		if (dom->fd < 0)
+			fprintf(stderr, "Warning: cannot open %s (%s), RAPL %s will be None\n",
+				path, strerror(errno), dom->name);
+
+		rapl_make_label(mon, dom);
+		mon->nr_domains++;
+	}
+
+	for (i = 0; i < nr_entries; i++)
+		free(entries[i]);
+	free(entries);
+
+	if (!mon->nr_domains)
+		fprintf(stderr, "Warning: no RAPL zones in %s, RAPL energy will not be logged\n",
+			RAPL_POWERCAP_DIR);
+}
+
+static unsigned long long rapl_energy_delta_uj(unsigned long long prev_uj,
+					       unsigned long long cur_uj,
+					       unsigned long long max_range_uj)
+{
+	if (cur_uj >= prev_uj)
+		return cur_uj - prev_uj;
+	/* energy_uj wrapped around max_energy_range_uj */
+	if (max_range_uj && prev_uj <= max_range_uj)
+		return max_range_uj - prev_uj + cur_uj;
+	return cur_uj;
+}
+
+static void rapl_sample(struct rapl_monitor *mon)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		struct rapl_domain *dom = &mon->domains[i];
+		unsigned long long cur_uj = 0;
+		unsigned long long delta_uj;
+		struct timespec ts;
+		__u64 now_ns;
+		int ret;
+
+		dom->power_valid = false;
+		if (dom->fd < 0)
+			continue;
+
+		if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+			continue;
+		now_ns = timespec_to_ns(&ts);
+
+		ret = read_ull_fd(dom->fd, &cur_uj);
+		if (ret < 0) {
+			if (!dom->read_error_reported)
+				fprintf(stderr, "Warning: failed to read RAPL %s energy (%s)\n",
+					dom->label, strerror(-ret));
+			dom->read_error_reported = true;
+			continue;
+		}
+
+		if (!dom->have_prev) {
+			dom->start_ns = now_ns;
+			dom->prev_ns = now_ns;
+			dom->prev_uj = cur_uj;
+			dom->have_prev = true;
+			continue;
+		}
+
+		delta_uj = rapl_energy_delta_uj(dom->prev_uj, cur_uj, dom->max_range_uj);
+		dom->total_uj += delta_uj;
+		if (now_ns > dom->prev_ns) {
+			/* uJ / ns = 1e3 W */
+			dom->power_w = (double)delta_uj * 1000.0 /
+				       (double)(now_ns - dom->prev_ns);
+			dom->power_valid = true;
+		}
+		dom->prev_uj = cur_uj;
+		dom->prev_ns = now_ns;
+	}
+}
+
+static void rapl_print_domains(const struct rapl_monitor *mon)
+{
+	size_t i;
+
+	if (!mon->nr_domains)
+		return;
+
+	printf("RAPL domains:");
+	for (i = 0; i < mon->nr_domains; i++)
+		printf(" %s=%s(%s)%s", mon->domains[i].label, mon->domains[i].zone,
+		       mon->domains[i].name, mon->domains[i].fd < 0 ? "[unreadable]" : "");
+	printf("\n");
+}
+
+static void rapl_print_summary(const struct rapl_monitor *mon)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		const struct rapl_domain *dom = &mon->domains[i];
+		double energy_j = (double)dom->total_uj / 1000000.0;
+		double duration_sec;
+
+		if (!dom->have_prev || dom->prev_ns <= dom->start_ns)
+			continue;
+
+		duration_sec = (double)(dom->prev_ns - dom->start_ns) / 1000000000.0;
+		printf("RAPL %s: energy=%.6f J over %.3f s, avg power=%.3f W\n",
+		       dom->label, energy_j, duration_sec, energy_j / duration_sec);
+	}
+}
+
+static void write_csv_rapl_header(FILE *csv, const struct rapl_monitor *mon)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++)
+		fprintf(csv, ",rapl_%s_energy_j,rapl_%s_power_w",
+			mon->domains[i].label, mon->domains[i].label);
+}
+
+static void write_csv_rapl_sample(FILE *csv, const struct rapl_monitor *mon)
+{
+	size_t i;
+
+	for (i = 0; i < mon->nr_domains; i++) {
+		const struct rapl_domain *dom = &mon->domains[i];
+
+		if (dom->have_prev)
+			fprintf(csv, ",%.6f", (double)dom->total_uj / 1000000.0);
+		else
+			fprintf(csv, ",None");
+
+		if (dom->power_valid)
+			fprintf(csv, ",%.6f", dom->power_w);
+		else
+			fprintf(csv, ",None");
+	}
+}
+
+static void write_rapl_sample_line(FILE *out, const struct rapl_monitor *mon)
+{
+	size_t i;
+
+	if (!mon->nr_domains)
+		return;
+
+	fprintf(out, "rapl:");
+	for (i = 0; i < mon->nr_domains; i++) {
+		const struct rapl_domain *dom = &mon->domains[i];
+
+		fprintf(out, " %s[", dom->label);
+		if (dom->power_valid)
+			fprintf(out, "p=%.3fW", dom->power_w);
+		else
+			fprintf(out, "p=n/a");
+		if (dom->have_prev)
+			fprintf(out, " e=%.6fJ]", (double)dom->total_uj / 1000000.0);
+		else
+			fprintf(out, " e=n/a]");
 	}
 	fprintf(out, "\n");
 }
@@ -1219,6 +1597,7 @@ int main(int argc, char **argv)
 	struct cpu_tis_reader tis_readers[NR_ISOLATED_CPUS];
 	struct cpu_freq_reader scaling_readers[NR_ISOLATED_CPUS];
 	struct cpu_freq_reader avg_readers[NR_ISOLATED_CPUS];
+	struct rapl_monitor rapl = {};
 	struct boost_state boost = {};
 	struct parsed_schedule schedule = {};
 	struct schedule_control control = {};
@@ -1308,6 +1687,8 @@ restart:
 		goto out;
 	}
 
+	rapl_open(&rapl);
+
 	csv = open_log_file(LOG_CSV_PATH);
 	if (!csv) {
 		ret = -errno;
@@ -1315,7 +1696,7 @@ restart:
 			       "open_log_file(%s)", LOG_CSV_PATH);
 		goto out;
 	}
-	write_csv_header(csv);
+	write_csv_header(csv, &rapl);
 
 	dbg = open_log_file(LOG_DBG_PATH);
 	if (!dbg) {
@@ -1349,6 +1730,7 @@ restart:
 	printf("Monitoring isolated CPUs %d-%d every %.3f s\n",
 	       ISOLATED_START, ISOLATED_END, sample_interval_sec);
 	printf("Sample format: policy|scaling_cur/cpuinfo_avg MHz\n");
+	rapl_print_domains(&rapl);
 	printf("Logging samples to %s\n", LOG_CSV_PATH);
 	printf("Logging debug samples to %s\n", LOG_DBG_PATH);
 
@@ -1374,6 +1756,8 @@ restart:
 		elapsed_sec =
 			(double)(timespec_to_ns(&now_ts) - timespec_to_ns(&start_ts)) /
 			1000000000.0;
+
+		rapl_sample(&rapl);
 
 		for (i = 0; i < NR_ISOLATED_CPUS; i++) {
 			ret = sample_policy_freq_mhz(&tis_readers[i], &policy_valid[i],
@@ -1414,9 +1798,10 @@ restart:
 		write_sample_line(dbg, elapsed_sec, policy_valid, policy_mhz,
 				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
 		write_debug_sample_line(dbg, debug_states);
+		write_rapl_sample_line(dbg, &rapl);
 		write_csv_sample(csv, elapsed_sec, policy_valid, policy_mhz,
 				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
-				 debug_states);
+				 debug_states, &rapl);
 		maybe_print_progress_timer(elapsed_sec, &last_timer_sec);
 
 		next_sample_ns += interval_ns;
@@ -1432,6 +1817,7 @@ out:
 	close_tis_readers(tis_readers);
 	close_cpu_freq_readers(scaling_readers);
 	close_cpu_freq_readers(avg_readers);
+	rapl_close(&rapl);
 	if (csv)
 		fclose(csv);
 	if (dbg)
@@ -1462,6 +1848,7 @@ out:
 
 	if (last_timer_sec >= 0)
 		printf("\n");
+	rapl_print_summary(&rapl);
 
 	restore_boost(&boost);
 	free_parsed_schedule(&schedule);
