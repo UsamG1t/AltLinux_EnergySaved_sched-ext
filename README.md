@@ -53,6 +53,32 @@ Loop mode also works with `--static-schedule`. `results/scx_borders/latest.csv`
 contains elapsed time and `cycle_index`; `latest.csv` and `dbg.log` are flushed
 and synchronized to disk once per second.
 
+`scx_borders` also records battery measurements separately in
+`results/scx_borders/battery.csv`. The file contains elapsed time, cycle index,
+remaining energy, instantaneous power, voltage, charge percentage, battery
+status and AC connection state. Missing power-supply fields are written as
+`None`; battery monitoring never changes the format of `latest.csv`.
+
+Plot one or more battery logs on the same graph:
+
+```bash
+python3 results/plot_battery.py \
+  results/experiment-a/battery.csv \
+  results/experiment-b/battery.csv
+```
+
+Each line is labelled with the input file name without its extension.
+
+Use `--union` to restrict all series to their common energy range and align
+them at the same time and energy origin. Use `--log` to display time on a
+logarithmic scale; the flags can be combined:
+
+```bash
+python3 results/plot_battery.py --union --log \
+  results/experiment-a/battery.csv \
+  results/experiment-b/battery.csv
+```
+
 ## `scx_scheduler`: calibration and run cycle
 
 The `scx_scheduler` pipeline has two mandatory calibration stages before the

@@ -30,7 +30,9 @@
 #define LOG_DIR "results/scx_borders"
 #define LOG_CSV_PATH LOG_DIR "/latest.csv"
 #define LOG_DBG_PATH LOG_DIR "/dbg.log"
+#define LOG_BATTERY_CSV_PATH LOG_DIR "/battery.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
+#define POWER_SUPPLY_CLASS_PATH "/sys/class/power_supply"
 #define LOG_SYNC_INTERVAL_NS 1000000000ULL
 #define RAPL_POWERCAP_DIR "/sys/class/powercap"
 #define RAPL_ZONE_PREFIX "intel-rapl:"
@@ -56,6 +58,35 @@ struct rapl_domain {
 struct rapl_monitor {
 	struct rapl_domain domains[MAX_RAPL_DOMAINS];
 	size_t nr_domains;
+};
+
+struct sysfs_field_reader {
+	int fd;
+	char path[PATH_MAX];
+};
+
+struct battery_monitor {
+	struct sysfs_field_reader energy_now;
+	struct sysfs_field_reader power_now;
+	struct sysfs_field_reader voltage_now;
+	struct sysfs_field_reader capacity;
+	struct sysfs_field_reader status;
+	struct sysfs_field_reader ac_online;
+};
+
+struct battery_sample {
+	bool energy_valid;
+	bool power_valid;
+	bool voltage_valid;
+	bool capacity_valid;
+	bool status_valid;
+	bool ac_online_valid;
+	long energy_now_uwh;
+	long power_now_uw;
+	long voltage_now_uv;
+	long capacity_pct;
+	long ac_online;
+	char status[32];
 };
 
 struct cpu_freq_reader {
@@ -272,6 +303,211 @@ static int sync_log_file(FILE *file)
 	if (fdatasync(fileno(file)) < 0)
 		return -errno;
 	return 0;
+}
+
+static void init_sysfs_field_reader(struct sysfs_field_reader *reader)
+{
+	reader->fd = -1;
+	reader->path[0] = '\0';
+}
+
+static void init_battery_monitor_readers(struct battery_monitor *monitor)
+{
+	init_sysfs_field_reader(&monitor->energy_now);
+	init_sysfs_field_reader(&monitor->power_now);
+	init_sysfs_field_reader(&monitor->voltage_now);
+	init_sysfs_field_reader(&monitor->capacity);
+	init_sysfs_field_reader(&monitor->status);
+	init_sysfs_field_reader(&monitor->ac_online);
+}
+
+static int read_text_path(const char *path, char *buf, size_t size)
+{
+	ssize_t nr_read;
+	int fd;
+
+	if (size < 2)
+		return -EINVAL;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
+	nr_read = pread(fd, buf, size - 1, 0);
+	close(fd);
+	if (nr_read <= 0)
+		return nr_read ? -errno : -EIO;
+
+	buf[nr_read] = '\0';
+	while (nr_read > 0 &&
+	       (buf[nr_read - 1] == '\n' || buf[nr_read - 1] == '\r' ||
+		buf[nr_read - 1] == ' ' || buf[nr_read - 1] == '\t'))
+		buf[--nr_read] = '\0';
+
+	return 0;
+}
+
+static int find_power_supply(const char *wanted_type, char *path, size_t size)
+{
+	struct dirent *entry;
+	DIR *dir;
+	int ret = -ENOENT;
+
+	dir = opendir(POWER_SUPPLY_CLASS_PATH);
+	if (!dir)
+		return -errno;
+
+	while ((entry = readdir(dir))) {
+		char type_path[PATH_MAX];
+		char type[32];
+		int len;
+
+		if (entry->d_name[0] == '.')
+			continue;
+
+		len = snprintf(type_path, sizeof(type_path), "%s/%s/type",
+			       POWER_SUPPLY_CLASS_PATH, entry->d_name);
+		if (len < 0 || (size_t)len >= sizeof(type_path))
+			continue;
+		if (read_text_path(type_path, type, sizeof(type)) < 0)
+			continue;
+		if (strcmp(type, wanted_type))
+			continue;
+
+		len = snprintf(path, size, "%s/%s", POWER_SUPPLY_CLASS_PATH,
+			       entry->d_name);
+		ret = len < 0 || (size_t)len >= size ? -ENAMETOOLONG : 0;
+		break;
+	}
+
+	closedir(dir);
+	return ret;
+}
+
+static void open_optional_sysfs_field(struct sysfs_field_reader *reader,
+				      const char *root, const char *name)
+{
+	int len;
+
+	if (!root[0])
+		return;
+
+	len = snprintf(reader->path, sizeof(reader->path), "%s/%s", root, name);
+	if (len < 0 || (size_t)len >= sizeof(reader->path)) {
+		reader->path[0] = '\0';
+		return;
+	}
+
+	reader->fd = open(reader->path, O_RDONLY | O_CLOEXEC);
+	if (reader->fd < 0) {
+		reader->fd = -1;
+		reader->path[0] = '\0';
+	}
+}
+
+static void init_battery_monitor(struct battery_monitor *monitor)
+{
+	char battery_path[PATH_MAX] = {};
+	char mains_path[PATH_MAX] = {};
+
+	init_battery_monitor_readers(monitor);
+	if (!find_power_supply("Battery", battery_path, sizeof(battery_path))) {
+		open_optional_sysfs_field(&monitor->energy_now, battery_path,
+					  "energy_now");
+		open_optional_sysfs_field(&monitor->power_now, battery_path,
+					  "power_now");
+		open_optional_sysfs_field(&monitor->voltage_now, battery_path,
+					  "voltage_now");
+		open_optional_sysfs_field(&monitor->capacity, battery_path,
+					  "capacity");
+		open_optional_sysfs_field(&monitor->status, battery_path,
+					  "status");
+	}
+
+	if (!find_power_supply("Mains", mains_path, sizeof(mains_path)))
+		open_optional_sysfs_field(&monitor->ac_online, mains_path,
+					  "online");
+}
+
+static void close_sysfs_field_reader(struct sysfs_field_reader *reader)
+{
+	if (reader->fd >= 0)
+		close(reader->fd);
+	init_sysfs_field_reader(reader);
+}
+
+static void close_battery_monitor(struct battery_monitor *monitor)
+{
+	close_sysfs_field_reader(&monitor->energy_now);
+	close_sysfs_field_reader(&monitor->power_now);
+	close_sysfs_field_reader(&monitor->voltage_now);
+	close_sysfs_field_reader(&monitor->capacity);
+	close_sysfs_field_reader(&monitor->status);
+	close_sysfs_field_reader(&monitor->ac_online);
+}
+
+static bool sample_sysfs_long(struct sysfs_field_reader *reader, long *value)
+{
+	char buf[64];
+	char *endp;
+	ssize_t nr_read;
+	long parsed;
+
+	if (reader->fd < 0)
+		return false;
+
+	nr_read = pread(reader->fd, buf, sizeof(buf) - 1, 0);
+	if (nr_read <= 0)
+		return false;
+
+	buf[nr_read] = '\0';
+	errno = 0;
+	parsed = strtol(buf, &endp, 10);
+	if (errno || endp == buf)
+		return false;
+
+	*value = parsed;
+	return true;
+}
+
+static bool sample_sysfs_text(struct sysfs_field_reader *reader, char *value,
+			      size_t size)
+{
+	ssize_t nr_read;
+
+	if (reader->fd < 0 || size < 2)
+		return false;
+
+	nr_read = pread(reader->fd, value, size - 1, 0);
+	if (nr_read <= 0)
+		return false;
+
+	value[nr_read] = '\0';
+	while (nr_read > 0 &&
+	       (value[nr_read - 1] == '\n' || value[nr_read - 1] == '\r' ||
+		value[nr_read - 1] == ' ' || value[nr_read - 1] == '\t'))
+		value[--nr_read] = '\0';
+
+	return nr_read > 0;
+}
+
+static void sample_battery_monitor(struct battery_monitor *monitor,
+				   struct battery_sample *sample)
+{
+	memset(sample, 0, sizeof(*sample));
+	sample->energy_valid =
+		sample_sysfs_long(&monitor->energy_now, &sample->energy_now_uwh);
+	sample->power_valid =
+		sample_sysfs_long(&monitor->power_now, &sample->power_now_uw);
+	sample->voltage_valid =
+		sample_sysfs_long(&monitor->voltage_now, &sample->voltage_now_uv);
+	sample->capacity_valid =
+		sample_sysfs_long(&monitor->capacity, &sample->capacity_pct);
+	sample->status_valid =
+		sample_sysfs_text(&monitor->status, sample->status,
+				  sizeof(sample->status));
+	sample->ac_online_valid =
+		sample_sysfs_long(&monitor->ac_online, &sample->ac_online);
 }
 
 static int read_long_file(const char *path, long *value)
@@ -846,6 +1082,54 @@ static void write_csv_freq_field(FILE *csv, bool valid, double freq_mhz)
 		fprintf(csv, ",%.6f", freq_mhz);
 	else
 		fprintf(csv, ",None");
+}
+
+static void write_csv_long_field(FILE *csv, bool valid, long value)
+{
+	if (valid)
+		fprintf(csv, ",%ld", value);
+	else
+		fprintf(csv, ",None");
+}
+
+static void write_csv_text_field(FILE *csv, bool valid, const char *value)
+{
+	const char *cursor;
+
+	if (!valid) {
+		fprintf(csv, ",None");
+		return;
+	}
+
+	fputs(",\"", csv);
+	for (cursor = value; *cursor; cursor++) {
+		if (*cursor == '"')
+			fputc('"', csv);
+		fputc(*cursor, csv);
+	}
+	fputc('"', csv);
+}
+
+static void write_battery_csv_header(FILE *csv)
+{
+	fprintf(csv,
+		"elapsed_sec,cycle_index,energy_now_uwh,power_now_uw,voltage_now_uv,capacity_pct,status,ac_online\n");
+}
+
+static void write_battery_csv_sample(FILE *csv, double elapsed_sec,
+				     __u64 cycle_index,
+				     const struct battery_sample *sample)
+{
+	fprintf(csv, "%.6f,%llu", elapsed_sec,
+		(unsigned long long)cycle_index);
+	write_csv_long_field(csv, sample->energy_valid, sample->energy_now_uwh);
+	write_csv_long_field(csv, sample->power_valid, sample->power_now_uw);
+	write_csv_long_field(csv, sample->voltage_valid,
+			     sample->voltage_now_uv);
+	write_csv_long_field(csv, sample->capacity_valid, sample->capacity_pct);
+	write_csv_text_field(csv, sample->status_valid, sample->status);
+	write_csv_long_field(csv, sample->ac_online_valid, sample->ac_online);
+	fputc('\n', csv);
 }
 
 static void write_csv_sample(FILE *csv, double elapsed_sec, __u64 cycle_index,
@@ -1785,12 +2069,14 @@ int main(int argc, char **argv)
 	struct cpu_freq_reader avg_readers[NR_ISOLATED_CPUS];
 	struct cpu_freq_border_writer border_writers[NR_ISOLATED_CPUS];
 	struct rapl_monitor rapl = {};
+	struct battery_monitor battery_monitor;
 	struct boost_state boost = {};
 	struct parsed_borders_schedule schedule = {};
 	struct borders_control control = {};
 	struct timespec start_ts;
 	FILE *csv = NULL;
 	FILE *dbg = NULL;
+	FILE *battery_csv = NULL;
 	double sample_interval_sec = 1.0;
 	const char *schedule_path = NULL;
 	__u64 ecode;
@@ -1812,6 +2098,7 @@ int main(int argc, char **argv)
 	init_cpu_freq_readers(scaling_readers);
 	init_cpu_freq_readers(avg_readers);
 	init_freq_border_writers(border_writers);
+	init_battery_monitor(&battery_monitor);
 
 	while ((opt = getopt(argc, argv, "f:lh")) != -1) {
 		switch (opt) {
@@ -1909,6 +2196,14 @@ restart:
 	}
 	fprintf(dbg, "run: loop=%u period_ns=%llu\n", control.loop_enabled,
 		(unsigned long long)control.deadline_ns);
+	battery_csv = open_log_file(LOG_BATTERY_CSV_PATH);
+	if (!battery_csv) {
+		ret = -errno;
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "open_log_file(%s)", LOG_BATTERY_CSV_PATH);
+		goto out;
+	}
+	write_battery_csv_header(battery_csv);
 	ret = sync_log_file(csv);
 	if (ret < 0) {
 		set_fail_stage(fail_stage, sizeof(fail_stage),
@@ -1919,6 +2214,12 @@ restart:
 	if (ret < 0) {
 		set_fail_stage(fail_stage, sizeof(fail_stage),
 			       "sync_log_file(debug header)");
+		goto out;
+	}
+	ret = sync_log_file(battery_csv);
+	if (ret < 0) {
+		set_fail_stage(fail_stage, sizeof(fail_stage),
+			       "sync_log_file(battery header)");
 		goto out;
 	}
 
@@ -1962,6 +2263,7 @@ restart:
 		double scaling_mhz[NR_ISOLATED_CPUS] = {};
 		double avg_mhz[NR_ISOLATED_CPUS] = {};
 		struct borders_debug_cpu_state debug_states[NR_ISOLATED_CPUS] = {};
+		struct battery_sample battery_sample;
 		struct timespec now_ts;
 		double elapsed_sec;
 		__u64 elapsed_ns;
@@ -2027,6 +2329,7 @@ restart:
 			}
 		}
 
+		sample_battery_monitor(&battery_monitor, &battery_sample);
 		write_sample_line(dbg, elapsed_sec, policy_valid, policy_mhz,
 				  scaling_valid, scaling_mhz, avg_valid, avg_mhz);
 		write_debug_sample_line(dbg, debug_states);
@@ -2035,6 +2338,8 @@ restart:
 				 policy_valid, policy_mhz,
 				 scaling_valid, scaling_mhz, avg_valid, avg_mhz,
 				 debug_states, &rapl);
+		write_battery_csv_sample(battery_csv, elapsed_sec, cycle_index,
+					 &battery_sample);
 		maybe_print_progress_timer(elapsed_sec, &last_timer_sec);
 
 		if (now_ns >= next_log_sync_ns) {
@@ -2048,6 +2353,12 @@ restart:
 			if (ret < 0) {
 				set_fail_stage(fail_stage, sizeof(fail_stage),
 					       "sync_log_file(debug)");
+				goto out;
+			}
+			ret = sync_log_file(battery_csv);
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "sync_log_file(battery)");
 				goto out;
 			}
 			next_log_sync_ns = now_ns + LOG_SYNC_INTERVAL_NS;
@@ -2075,6 +2386,10 @@ out:
 		sync_log_file(dbg);
 		fclose(dbg);
 	}
+	if (battery_csv) {
+		sync_log_file(battery_csv);
+		fclose(battery_csv);
+	}
 	if (link)
 		bpf_link__destroy(link);
 
@@ -2093,6 +2408,7 @@ out:
 		last_timer_sec = -1;
 		csv = NULL;
 		dbg = NULL;
+		battery_csv = NULL;
 		link = NULL;
 		skel = NULL;
 		exit_req = 0;
@@ -2103,6 +2419,7 @@ out:
 		printf("\n");
 	rapl_print_summary(&rapl);
 
+	close_battery_monitor(&battery_monitor);
 	restore_freq_borders(border_writers);
 	restore_boost(&boost);
 	free_parsed_borders_schedule(&schedule);
