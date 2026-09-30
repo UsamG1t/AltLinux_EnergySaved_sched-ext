@@ -11,9 +11,11 @@ from pathlib import Path
 DEFAULT_STAIRS_LOG_PATH = Path("./results/scx_stairs/latest.csv")
 DEFAULT_SCHEDULER_LOG_PATH = Path("./results/scx_scheduler/latest.csv")
 DEFAULT_ERF_LOG_PATH = Path("./results/scx_erf/latest.csv")
+DEFAULT_BORDERS_LOG_PATH = Path("./results/scx_borders/latest.csv")
 
 CPU_METRIC_RE = re.compile(r"^cpu(\d+)_(policy|scaling|avg)_mhz$")
 CPU_OLD_RE = re.compile(r"^cpu(\d+)_mhz$")
+RAPL_FIELD_RE = re.compile(r"^rapl_(.+)_(energy_j|power_w)$")
 
 METRIC_ORDER = ("policy", "scaling", "avg")
 METRIC_LABELS = {
@@ -45,6 +47,24 @@ METRIC_WIDTHS = {
 SCHEDULE_LINE_COLOR = "#7c3aed"
 SCHEDULE_TEXT_COLOR = "#4c1d95"
 SCHEDULE_LINE_WIDTH = 6.0
+
+# RAPL rows are machine-wide: one full-width panel below the per-CPU panels.
+RAPL_KINDS = ("power", "energy")
+RAPL_FIELD_SUFFIXES = {
+    "power": "power_w",
+    "energy": "energy_j",
+}
+RAPL_TITLES = {
+    "power": "RAPL instantaneous power",
+    "energy": "RAPL cumulative energy",
+}
+RAPL_Y_LABELS = {
+    "power": "Мощность (Вт)",
+    "energy": "Энергия (Дж)",
+}
+RAPL_COLORS = ("#b91c1c", "#1d4ed8", "#15803d", "#a16207", "#7c3aed", "#0e7490")
+RAPL_LINE_WIDTH = 1.8
+FREQ_Y_LABEL = "Тактовая частота (МГц)"
 
 
 @dataclass(frozen=True)
@@ -122,7 +142,23 @@ def parse_float_or_nan(value: str) -> float:
     return float(text)
 
 
-def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], list[dict[str, float]]]:
+def rapl_field(domain: str, kind: str) -> str:
+    return f"rapl_{domain}_{RAPL_FIELD_SUFFIXES[kind]}"
+
+
+def find_rapl_domains(fieldnames: list[str]) -> tuple[str, ...]:
+    domains: list[str] = []
+
+    for field in fieldnames:
+        match = RAPL_FIELD_RE.match(field)
+        if match and match.group(1) not in domains:
+            domains.append(match.group(1))
+
+    return tuple(domains)
+
+
+def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], tuple[str, ...],
+                                       list[dict[str, float]]]:
     rows: list[dict[str, float]] = []
 
     with path.open("r", encoding="utf-8", newline="") as file:
@@ -154,6 +190,7 @@ def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], list[dict[str
             metric for metric in METRIC_ORDER
             if any(metric in columns[cpu] for cpu in cpus)
         )
+        rapl_domains = find_rapl_domains(reader.fieldnames)
 
         for raw_row in reader:
             row = {"elapsed_sec": float(raw_row["elapsed_sec"])}
@@ -167,9 +204,13 @@ def load_log_rows(path: Path) -> tuple[list[int], tuple[str, ...], list[dict[str
 
                     value = raw_row.get(field, "")
                     row[key] = parse_float_or_nan(value)
+            for domain in rapl_domains:
+                for kind in RAPL_KINDS:
+                    key = rapl_field(domain, kind)
+                    row[key] = parse_float_or_nan(raw_row.get(key) or "")
             rows.append(row)
 
-    return cpus, metrics, rows
+    return cpus, metrics, rapl_domains, rows
 
 
 def select_default_metrics(available_metrics: tuple[str, ...]) -> tuple[str, ...]:
@@ -185,7 +226,8 @@ def select_default_metrics(available_metrics: tuple[str, ...]) -> tuple[str, ...
 def build_row_specs(available_metrics: tuple[str, ...],
                     main_mode: bool,
                     debug_mode: bool,
-                    have_schedule: bool) -> list[RowSpec]:
+                    have_schedule: bool,
+                    power_mode: bool = False) -> list[RowSpec]:
     row_specs: list[RowSpec] = []
 
     if have_schedule:
@@ -206,7 +248,70 @@ def build_row_specs(available_metrics: tuple[str, ...],
                 RowSpec("metrics", METRIC_LABELS[selected_metrics[0]], selected_metrics)
             )
 
+    if power_mode:
+        for kind in RAPL_KINDS:
+            row_specs.append(RowSpec(kind, RAPL_TITLES[kind]))
+
     return row_specs
+
+
+def is_rapl_row(row_spec: RowSpec) -> bool:
+    return row_spec.kind in RAPL_KINDS
+
+
+def rapl_series(rows: list[dict[str, float]], domain: str,
+                kind: str) -> tuple[list[float], list[float]]:
+    times = []
+    values = []
+    key = rapl_field(domain, kind)
+
+    for row in rows:
+        value = row.get(key, math.nan)
+        if not math.isfinite(value):
+            continue
+        times.append(row["elapsed_sec"])
+        values.append(value)
+
+    return times, values
+
+
+def rapl_domains_with_data(rows: list[dict[str, float]],
+                           rapl_domains: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        domain for domain in rapl_domains
+        if any(rapl_series(rows, domain, kind)[0] for kind in RAPL_KINDS)
+    )
+
+
+def rapl_y_limits(rows: list[dict[str, float]], rapl_domains: tuple[str, ...],
+                  kind: str) -> tuple[float, float]:
+    values = [
+        value
+        for domain in rapl_domains
+        for value in rapl_series(rows, domain, kind)[1]
+    ]
+    if not values:
+        return 0.0, 1.0
+
+    high = max(values)
+    if high <= 0.0:
+        return 0.0, 1.0
+    return 0.0, high * 1.08
+
+
+def rapl_color(index: int) -> str:
+    return RAPL_COLORS[index % len(RAPL_COLORS)]
+
+
+def rapl_legend_label(rows: list[dict[str, float]], domain: str, kind: str) -> str:
+    if kind != "energy":
+        return domain
+
+    # Energy consumed inside the displayed window (whole run without -t).
+    _, values = rapl_series(rows, domain, "energy")
+    if not values:
+        return domain
+    return f"{domain}: {values[-1] - values[0]:.2f} J"
 
 
 def filter_rows(rows: list[dict[str, float]],
@@ -417,6 +522,29 @@ def step_points(times: list[float], freqs: list[float]) -> list[tuple[float, flo
     return points
 
 
+def step_points_pre(times: list[float], values: list[float]) -> list[tuple[float, float]]:
+    # values[i] is an average over (times[i - 1], times[i]]
+    points = []
+    if not times:
+        return points
+
+    points.append((times[0], values[0]))
+    for index in range(1, len(times)):
+        points.append((times[index - 1], values[index]))
+        points.append((times[index], values[index]))
+
+    return points
+
+
+def tick_format_for(limits: tuple[float, float]) -> str:
+    span = limits[1] - limits[0]
+    if span >= 50.0:
+        return "{:.0f}"
+    if span >= 5.0:
+        return "{:.1f}"
+    return "{:.2f}"
+
+
 def map_x(value: float, x0: float, x1: float, width: float) -> float:
     if math.isclose(x0, x1):
         return width / 2.0
@@ -451,10 +579,28 @@ def render_svg_metric_legend(parts: list[str], metrics: tuple[str, ...],
         x += 132.0
 
 
+def render_svg_legend(parts: list[str], entries: list[tuple[str, str]],
+                      origin_x: float, origin_y: float) -> None:
+    x = origin_x
+
+    for label, color in entries:
+        parts.append(
+            f'<line x1="{x:.1f}" y1="{origin_y:.1f}" x2="{x + 18:.1f}" y2="{origin_y:.1f}" '
+            f'stroke="{color}" stroke-width="3"/>'
+        )
+        parts.append(
+            f'<text x="{x + 24:.1f}" y="{origin_y + 4:.1f}" font-family="sans-serif" '
+            f'font-size="11">{escape(label)}</text>'
+        )
+        x += 40.0 + 7.0 * len(label)
+
+
 def render_svg_axes(parts: list[str], origin_x: float, origin_y: float,
                     width: float, height: float,
                     limits: tuple[float, float],
-                    x_limits: tuple[float, float]) -> tuple[float, float, float, float]:
+                    x_limits: tuple[float, float],
+                    y_label: str = FREQ_Y_LABEL,
+                    tick_format: str = "{:.0f}") -> tuple[float, float, float, float]:
     inner_left = 62.0
     inner_right = 18.0
     inner_top = 44.0
@@ -479,7 +625,7 @@ def render_svg_axes(parts: list[str], origin_x: float, origin_y: float,
         )
         parts.append(
             f'<text x="{plot_x - 8:.1f}" y="{y + 4:.1f}" font-family="sans-serif" '
-            f'font-size="11" text-anchor="end">{tick:.0f}</text>'
+            f'font-size="11" text-anchor="end">{tick_format.format(tick)}</text>'
         )
 
     for tick in x_ticks:
@@ -506,7 +652,7 @@ def render_svg_axes(parts: list[str], origin_x: float, origin_y: float,
         f'<text x="{origin_x + 16:.1f}" y="{plot_y + plot_height / 2:.1f}" '
         'font-family="sans-serif" font-size="12" text-anchor="middle" '
         f'transform="rotate(-90 {origin_x + 16:.1f} {plot_y + plot_height / 2:.1f})">'
-        'Тактовая частота (МГц)</text>'
+        f'{escape(y_label)}</text>'
     )
 
     return plot_x, plot_y, plot_width, plot_height
@@ -519,15 +665,16 @@ def render_svg_metric_panel(parts: list[str], rows: list[dict[str, float]], cpu:
     metrics = metric_legend_metrics(row_spec)
     has_data = False
 
+    # Axes first: render_svg_axes paints the opaque panel background.
+    plot_x, plot_y, plot_width, plot_height = render_svg_axes(
+        parts, origin_x, origin_y, width, height, limits, x_limits
+    )
     parts.append(
         f'<text x="{origin_x + width / 2:.1f}" y="{origin_y + 18:.1f}" '
         'font-family="sans-serif" font-size="14" font-weight="bold" text-anchor="middle">'
         f'{escape(f"CPU {cpu} · {row_spec.title}")}</text>'
     )
     render_svg_metric_legend(parts, metrics, origin_x + 18.0, origin_y + 32.0)
-    plot_x, plot_y, plot_width, plot_height = render_svg_axes(
-        parts, origin_x, origin_y, width, height, limits, x_limits
-    )
 
     for metric in metrics:
         times, freqs = cpu_metric_series(rows, cpu, metric)
@@ -565,13 +712,14 @@ def render_svg_schedule_panel(parts: list[str],
                               width: float, height: float) -> None:
     entries = schedule_by_cpu.get(cpu, [])
 
+    # Axes first: render_svg_axes paints the opaque panel background.
+    plot_x, plot_y, plot_width, plot_height = render_svg_axes(
+        parts, origin_x, origin_y, width, height, limits, x_limits
+    )
     parts.append(
         f'<text x="{origin_x + width / 2:.1f}" y="{origin_y + 18:.1f}" '
         'font-family="sans-serif" font-size="14" font-weight="bold" text-anchor="middle">'
         f'{escape(f"CPU {cpu} · planned schedule")}</text>'
-    )
-    plot_x, plot_y, plot_width, plot_height = render_svg_axes(
-        parts, origin_x, origin_y, width, height, limits, x_limits
     )
 
     if not entries:
@@ -614,16 +762,74 @@ def render_svg_schedule_panel(parts: list[str],
             )
 
 
+def render_svg_rapl_panel(parts: list[str], rows: list[dict[str, float]],
+                          rapl_domains: tuple[str, ...], row_spec: RowSpec,
+                          x_limits: tuple[float, float], origin_x: float,
+                          origin_y: float, width: float, height: float) -> None:
+    kind = row_spec.kind
+    limits = rapl_y_limits(rows, rapl_domains, kind)
+    has_data = False
+
+    # Axes first: render_svg_axes paints the opaque panel background.
+    plot_x, plot_y, plot_width, plot_height = render_svg_axes(
+        parts, origin_x, origin_y, width, height, limits, x_limits,
+        y_label=RAPL_Y_LABELS[kind], tick_format=tick_format_for(limits),
+    )
+    parts.append(
+        f'<text x="{origin_x + width / 2:.1f}" y="{origin_y + 18:.1f}" '
+        'font-family="sans-serif" font-size="14" font-weight="bold" text-anchor="middle">'
+        f'{escape(row_spec.title)}</text>'
+    )
+    render_svg_legend(
+        parts,
+        [(rapl_legend_label(rows, domain, kind), rapl_color(index))
+         for index, domain in enumerate(rapl_domains)],
+        origin_x + 18.0, origin_y + 32.0,
+    )
+
+    for index, domain in enumerate(rapl_domains):
+        times, values = rapl_series(rows, domain, kind)
+        if not times:
+            continue
+
+        has_data = True
+        points = step_points_pre(times, values) if kind == "power" else list(zip(times, values))
+        svg_points = " ".join(
+            f"{plot_x + map_x(time, x_limits[0], x_limits[1], plot_width):.1f},"
+            f"{plot_y + map_y(value, limits[0], limits[1], plot_height):.1f}"
+            for time, value in points
+        )
+        parts.append(
+            f'<polyline fill="none" stroke="{rapl_color(index)}" '
+            f'stroke-width="{RAPL_LINE_WIDTH:.1f}" points="{svg_points}"/>'
+        )
+
+    if not has_data:
+        parts.append(
+            f'<text x="{plot_x + plot_width / 2:.1f}" y="{plot_y + plot_height / 2:.1f}" '
+            'font-family="sans-serif" font-size="13" text-anchor="middle" fill="#64748b">'
+            'No data</text>'
+        )
+
+
+def frequency_limits(rows: list[dict[str, float]], cpus: list[int],
+                     row_specs: list[RowSpec],
+                     schedule_by_cpu: dict[int, list[ScheduleEntry]]) -> tuple[float, float]:
+    values = gather_all_values(rows, cpus, row_specs, schedule_by_cpu)
+    if values:
+        return y_limits(values)
+    if any(not is_rapl_row(row_spec) for row_spec in row_specs):
+        raise ValueError("no finite frequency samples or schedule entries in the selected range")
+    return 0.0, 1.0
+
+
 def render_svg(rows: list[dict[str, float]], cpus: list[int],
                row_specs: list[RowSpec],
                schedule_by_cpu: dict[int, list[ScheduleEntry]],
                time_range: tuple[float, float] | None,
-               output_path: Path, source_name: str) -> Path:
-    values = gather_all_values(rows, cpus, row_specs, schedule_by_cpu)
-    if not values:
-        raise ValueError("no finite frequency samples or schedule entries in the selected range")
-
-    limits = y_limits(values)
+               output_path: Path, source_name: str,
+               rapl_domains: tuple[str, ...] = ()) -> Path:
+    limits = frequency_limits(rows, cpus, row_specs, schedule_by_cpu)
     x_limits = compute_x_limits(rows, schedule_by_cpu, cpus, time_range)
     panel_width = 540.0
     panel_height = 320.0
@@ -643,6 +849,14 @@ def render_svg(rows: list[dict[str, float]], cpus: list[int],
     ]
 
     for row_idx, row_spec in enumerate(row_specs):
+        if is_rapl_row(row_spec):
+            render_svg_rapl_panel(
+                parts, rows, rapl_domains, row_spec, x_limits,
+                margin_x, top + row_idx * (panel_height + gap_y),
+                width - margin_x * 2, panel_height,
+            )
+            continue
+
         for col_idx, cpu in enumerate(cpus):
             origin_x = margin_x + col_idx * (panel_width + gap_x)
             origin_y = top + row_idx * (panel_height + gap_y)
@@ -738,6 +952,35 @@ def plot_schedule_axis(ax, schedule_by_cpu: dict[int, list[ScheduleEntry]],
     ax.grid(True, linestyle="--", alpha=0.5)
 
 
+def plot_rapl_axis(ax, rows: list[dict[str, float]], rapl_domains: tuple[str, ...],
+                   row_spec: RowSpec) -> None:
+    kind = row_spec.kind
+    has_data = False
+
+    for index, domain in enumerate(rapl_domains):
+        times, values = rapl_series(rows, domain, kind)
+        if not times:
+            continue
+
+        has_data = True
+        label = rapl_legend_label(rows, domain, kind)
+        if kind == "power":
+            ax.step(times, values, where="pre", color=rapl_color(index),
+                    linewidth=RAPL_LINE_WIDTH, label=label)
+        else:
+            ax.plot(times, values, color=rapl_color(index),
+                    linewidth=RAPL_LINE_WIDTH, label=label)
+
+    if not has_data:
+        ax.text(0.5, 0.5, "No data", transform=ax.transAxes,
+                ha="center", va="center")
+    else:
+        ax.legend(loc="upper left", fontsize=9)
+
+    ax.set_ylim(*rapl_y_limits(rows, rapl_domains, kind))
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+
 def compute_x_limits(rows: list[dict[str, float]],
                      schedule_by_cpu: dict[int, list[ScheduleEntry]],
                      cpus: list[int],
@@ -760,60 +1003,82 @@ def plot_rows(rows: list[dict[str, float]], cpus: list[int],
               row_specs: list[RowSpec],
               schedule_by_cpu: dict[int, list[ScheduleEntry]],
               time_range: tuple[float, float] | None,
-              log_path: Path, source_name: str) -> None:
+              log_path: Path, source_name: str,
+              rapl_domains: tuple[str, ...] = (),
+              output_path: Path | None = None) -> None:
     plt = import_pyplot()
     if plt is None:
-        output_path = render_svg(
+        if output_path is not None and output_path.suffix.lower() != ".svg":
+            raise ValueError(
+                f"matplotlib is not installed, only .svg output is supported: {output_path}"
+            )
+        saved_path = render_svg(
             rows,
             cpus,
             row_specs,
             schedule_by_cpu,
             time_range,
-            svg_output_path(log_path, cpus),
+            output_path or svg_output_path(log_path, cpus),
             source_name,
+            rapl_domains,
         )
-        print(f"matplotlib is not installed, SVG graph saved to {output_path}")
+        print(f"matplotlib is not installed, SVG graph saved to {saved_path}")
         return
 
-    values = gather_all_values(rows, cpus, row_specs, schedule_by_cpu)
-    if not values:
-        raise ValueError("no finite frequency samples or schedule entries in the selected range")
-
-    limits = y_limits(values)
+    limits = frequency_limits(rows, cpus, row_specs, schedule_by_cpu)
     x_limits = compute_x_limits(rows, schedule_by_cpu, cpus, time_range)
 
     nrows = len(row_specs)
     ncols = len(cpus)
     fig_width = max(6.0, 5.4 * ncols)
     fig_height = max(3.4, 2.9 * nrows + 0.8)
-    fig, axes = plt.subplots(
-        nrows,
-        ncols,
-        figsize=(fig_width, fig_height),
-        sharex=True,
-        squeeze=False,
-    )
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    grid = fig.add_gridspec(nrows, ncols)
+    first_ax = None
 
     for row_idx, row_spec in enumerate(row_specs):
-        for col_idx, cpu in enumerate(cpus):
-            ax = axes[row_idx][col_idx]
-            if row_spec.kind == "metrics":
-                plot_metric_axis(ax, rows, cpu, row_spec, limits)
+        if is_rapl_row(row_spec):
+            row_cells = [(grid[row_idx, :], None)]
+        else:
+            row_cells = [(grid[row_idx, col_idx], cpu) for col_idx, cpu in enumerate(cpus)]
+
+        for cell, cpu in row_cells:
+            ax = fig.add_subplot(cell, sharex=first_ax)
+            if first_ax is None:
+                first_ax = ax
+
+            if is_rapl_row(row_spec):
+                plot_rapl_axis(ax, rows, rapl_domains, row_spec)
+                ax.set_title(row_spec.title)
+                ax.set_ylabel(RAPL_Y_LABELS[row_spec.kind])
             else:
-                plot_schedule_axis(ax, schedule_by_cpu, cpu, limits, x_limits)
+                if row_spec.kind == "metrics":
+                    plot_metric_axis(ax, rows, cpu, row_spec, limits)
+                else:
+                    plot_schedule_axis(ax, schedule_by_cpu, cpu, limits, x_limits)
+                ax.set_title(f"CPU {cpu} · {row_spec.title}")
+                ax.set_ylabel(FREQ_Y_LABEL)
 
             ax.set_xlim(*x_limits)
-            ax.set_title(f"CPU {cpu} · {row_spec.title}")
-            ax.set_ylabel("Тактовая частота (МГц)")
             if row_idx == nrows - 1:
                 ax.set_xlabel("Время (с)")
     fig.tight_layout()
+
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        print(f"Graph saved to {output_path}")
+        return
+
     plt.show()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Plot frequency logs collected by scx_stairs, scx_scheduler, or scx_erf."
+        description=(
+            "Plot frequency and RAPL energy logs collected by scx_stairs, "
+            "scx_scheduler, scx_erf, or scx_borders."
+        )
     )
     parser.add_argument(
         "file_path",
@@ -847,6 +1112,16 @@ def main() -> int:
         dest="input_schedule",
         help="Path to the static schedule file produced for the scheduler run",
     )
+    parser.add_argument(
+        "--power",
+        action="store_true",
+        help="Add full-width rows with RAPL instantaneous power and cumulative energy",
+    )
+    parser.add_argument(
+        "-o",
+        dest="output_path",
+        help="Save the graph to this file (.png, .svg, .pdf) instead of showing it",
+    )
     source_group = parser.add_mutually_exclusive_group()
     source_group.add_argument(
         "--scheduler",
@@ -858,9 +1133,17 @@ def main() -> int:
         action="store_true",
         help=f"Use scx_erf log by default ({DEFAULT_ERF_LOG_PATH}) instead of scx_stairs",
     )
+    source_group.add_argument(
+        "--borders",
+        action="store_true",
+        help=f"Use scx_borders log by default ({DEFAULT_BORDERS_LOG_PATH}) instead of scx_stairs",
+    )
     args = parser.parse_args()
 
-    if args.erf:
+    if args.borders:
+        default_log_path = DEFAULT_BORDERS_LOG_PATH
+        source_name = "scx_borders"
+    elif args.erf:
         default_log_path = DEFAULT_ERF_LOG_PATH
         source_name = "scx_erf"
     elif args.scheduler:
@@ -882,7 +1165,9 @@ def main() -> int:
 
     try:
         time_range = parse_time_range(args.time_range) if args.time_range else None
-        available_cpus, available_metrics, rows = load_log_rows(log_path)
+        available_cpus, available_metrics, rapl_domains, rows = load_log_rows(log_path)
+        if args.power and not rapl_domains:
+            raise ValueError(f"log file has no RAPL columns: {log_path}")
         selected_cpus = (
             parse_cpu_selection(args.cpu_selection, available_cpus)
             if args.cpu_selection
@@ -895,6 +1180,7 @@ def main() -> int:
         available_metrics = metrics_with_finite_values(
             rows, selected_cpus, available_metrics
         )
+        rapl_domains = rapl_domains_with_data(rows, rapl_domains)
 
         raw_schedule = parse_schedule_file(schedule_path) if schedule_path else {}
         schedule_by_cpu = filter_schedule(raw_schedule, selected_cpus, time_range)
@@ -903,11 +1189,13 @@ def main() -> int:
             main_mode=args.main,
             debug_mode=args.debug,
             have_schedule=bool(schedule_path),
+            power_mode=args.power,
         )
 
+        output_path = Path(args.output_path) if args.output_path else None
         plot_rows(rows, selected_cpus, row_specs, schedule_by_cpu, time_range,
-                  log_path, source_name)
-    except (ValueError, RuntimeError) as exc:
+                  log_path, source_name, rapl_domains, output_path)
+    except (ValueError, RuntimeError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

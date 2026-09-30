@@ -287,6 +287,27 @@ Notes:
   fields are written as `None`, while the run continues using
   `scaling_cur_freq` and `cpuinfo_avg_freq`.
 
+#### RAPL energy and power
+
+`scx_scheduler` and `scx_borders` also sample the RAPL energy counters from
+`/sys/class/powercap/intel-rapl:*` on every sampling interval. RAPL domains are
+machine-wide (package, all cores together, uncore, DRAM, platform), not
+per-CPU.
+
+- `latest.csv` gets two columns per domain after the per-CPU columns:
+  `rapl_<domain>_energy_j` (energy since the start of the run, counter
+  wrap-around handled) and `rapl_<domain>_power_w` (average power over the
+  last sampling interval);
+- domain names come from the powercap zone names: `pkg0` (`package-0`),
+  `pkg0_core`, `pkg0_uncore`, `pkg0_dram`, `psys`;
+- `dbg.log` gets a `rapl:` line after each `dbg:` line;
+- the scheduler prints the found domains at start and the energy and average
+  power per domain at exit.
+
+`energy_uj` is readable by root only. The schedulers are started as root, so
+no extra setup is needed. If RAPL is missing or unreadable, the run continues
+with a warning and the RAPL fields are written as `None`.
+
 ### 8. Plot the main run results
 
 Plot the normal run metrics with the static schedule shown on the first row:
@@ -307,6 +328,35 @@ python3 results/plot_scx.py \
   --input build/scx_scheduler/run/static_schedule.txt \
   results/scx_scheduler/latest.csv
 ```
+
+Add `--power` to append two full-width rows under the per-CPU rows: RAPL
+instantaneous power (W) and cumulative energy (J) for every RAPL domain. The
+energy legend shows the energy consumed inside the displayed time range:
+
+```bash
+python3 results/plot_scx.py \
+  --main \
+  --power \
+  --input build/scx_scheduler/run/static_schedule.txt \
+  results/scx_scheduler/latest.csv
+```
+
+Use `-o` to save the graph to a file instead of opening a window, for example
+on a machine reached over ssh. With matplotlib the format follows the
+extension (`.png`, `.svg`, `.pdf`); without matplotlib only `.svg` is
+supported:
+
+```bash
+python3 results/plot_scx.py \
+  --main \
+  --power \
+  --input build/scx_borders/run/static_schedule.txt \
+  results/scx_borders/latest.csv \
+  -o results/scx_borders/latest.png
+```
+
+`--borders` selects `results/scx_borders/latest.csv` as the default log, like
+`--scheduler` and `--erf` do for their schedulers.
 
 ### 9. Plot the debug log
 
