@@ -374,10 +374,15 @@ def plot_with_matplotlib(
     series_list: list[BatterySeries],
     log_scale: bool,
     use_mah: bool,
+    output_path: Path | None = None,
 ) -> None:
     plt = import_pyplot()
     if plt is None:
-        output_path = Path("battery_plot.svg")
+        if output_path is not None and output_path.suffix.lower() != ".svg":
+            raise ValueError(
+                f"matplotlib не установлен, поддерживается только вывод в .svg: {output_path}"
+            )
+        output_path = output_path or Path("battery_plot.svg")
         render_svg(series_list, output_path, log_scale, use_mah)
         print(f"matplotlib не установлен, график сохранён в {output_path}")
         return
@@ -424,6 +429,13 @@ def plot_with_matplotlib(
     )
     ax.legend()
     fig.tight_layout()
+
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150)
+        plt.close(fig)
+        print(f"График сохранён в {output_path}")
+        return
+
     plt.show()
 
 
@@ -458,6 +470,15 @@ def main() -> int:
             "используется charge_now_uah или расчёт energy_now_uwh/voltage_now_uv"
         ),
     )
+    parser.add_argument(
+        "-o",
+        dest="output_path",
+        type=Path,
+        help=(
+            "Сохранить график в файл (.png, .svg, .pdf) вместо показа окна; "
+            "без matplotlib поддерживается только .svg"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -468,7 +489,7 @@ def main() -> int:
             series_list.append(load_battery_log(path, args.mah))
         if args.union:
             series_list = union_series_ranges(series_list)
-        plot_with_matplotlib(series_list, args.log, args.mah)
+        plot_with_matplotlib(series_list, args.log, args.mah, args.output_path)
     except (OSError, ValueError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1

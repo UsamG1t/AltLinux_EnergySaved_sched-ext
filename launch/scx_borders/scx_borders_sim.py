@@ -523,6 +523,44 @@ def calibration_env_vars(args: argparse.Namespace, coeff: int) -> dict[str, str]
     return env
 
 
+TASKS_CSV_HEADER = (
+    "cycle_index,task_id,cpu,release_sec,planned_start_sec,planned_end_sec,"
+    "deadline_sec,finish_sec,status,returncode,met_deadline\n"
+)
+
+
+class TaskLog:
+    """Per-instance task outcomes; times are seconds since the release clock start."""
+
+    def __init__(self, path: Path, deadline_ms: int):
+        self.file = path.open("w", encoding="utf-8")
+        self.file.write(TASKS_CSV_HEADER)
+        self.period_sec = deadline_ms / 1000.0
+        self.counts = {"done": 0, "killed": 0, "failed": 0, "missed": 0}
+
+    def record(self, plan: TaskPlan, cycle_index: int, release_sec: float,
+               finish_sec: float | None, status: str,
+               returncode: int | None) -> None:
+        offset = cycle_index * self.period_sec
+        deadline_sec = offset + self.period_sec
+        met = status == "done" and finish_sec is not None and finish_sec <= deadline_sec
+        self.counts[status] += 1
+        if status == "done" and not met:
+            self.counts["missed"] += 1
+        self.file.write(
+            f"{cycle_index},{plan.task_id},{plan.cpu},{release_sec:.6f},"
+            f"{offset + plan.start_ns / 1e9:.6f},"
+            f"{offset + (plan.start_ns + plan.duration_ns) / 1e9:.6f},"
+            f"{deadline_sec:.6f},"
+            f"{'' if finish_sec is None else f'{finish_sec:.6f}'},"
+            f"{status},{'' if returncode is None else returncode},{int(met)}\n"
+        )
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
 def launch_simulation(
     args: argparse.Namespace,
     deadline_ms: int,
@@ -532,11 +570,13 @@ def launch_simulation(
     run_dir = args.run_dir.resolve()
     borders_bin = args.borders.resolve()
     origin_bin = args.origin.resolve()
-    log_dir = run_dir / "logs"
+    log_dir = args.results_dir.resolve() if args.results_dir else run_dir / "logs"
     static_schedule_path = run_dir / "static_schedule.txt"
-    task_procs: list[tuple[subprocess.Popen[bytes], TaskPlan, int]] = []
+    # (process, plan, cycle_index, release_sec)
+    task_procs: list[tuple[subprocess.Popen[bytes], TaskPlan, int, float]] = []
     task_links: list[Path] = []
     borders_proc: subprocess.Popen[bytes] | None = None
+    task_log: TaskLog | None = None
 
     if not borders_bin.is_file():
         raise SimulatorError(f"Borders binary not found: {borders_bin}")
@@ -553,6 +593,8 @@ def launch_simulation(
             shutil.copyfile(schedule_path, static_schedule_path)
         else:
             static_schedule_path = schedule_path
+    if args.results_dir:
+        shutil.copyfile(static_schedule_path, log_dir / "static_schedule.txt")
 
     for plan in plans:
         link_path = run_dir / plan.name
@@ -568,6 +610,10 @@ def launch_simulation(
     ]
     if args.loop:
         borders_cmd.append("-l")
+    if args.baseline:
+        borders_cmd.append("-M")
+    if args.results_dir:
+        borders_cmd.extend(["-o", str(log_dir)])
     borders_cmd.append(str(static_schedule_path))
     print("Starting scx_borders:", " ".join(borders_cmd))
     print(f"Static schedule written to {static_schedule_path}")
@@ -591,7 +637,10 @@ def launch_simulation(
     else:
         raise SimulatorError("Timed out waiting for scx_borders activation")
 
+    task_log = TaskLog(log_dir / "tasks.csv", deadline_ms)
     start_monotonic = time.monotonic()
+    print(f"Release clock start: CLOCK_MONOTONIC {start_monotonic:.6f} s")
+    end_time = start_monotonic + args.duration if args.duration else None
     release_plans = sorted(plans, key=lambda plan: (plan.ready_ms, plan.start_ns, plan.cpu, plan.order))
     period_sec = deadline_ms / 1000.0
 
@@ -602,14 +651,16 @@ def launch_simulation(
             )
 
     def reap_finished_tasks() -> None:
-        running: list[tuple[subprocess.Popen[bytes], TaskPlan, int]] = []
+        running: list[tuple[subprocess.Popen[bytes], TaskPlan, int, float]] = []
+        now_sec = time.monotonic() - start_monotonic
 
-        for proc, plan, cycle_index in task_procs:
+        for proc, plan, cycle_index, release_sec in task_procs:
             rc = proc.poll()
             if rc is None:
-                running.append((proc, plan, cycle_index))
+                running.append((proc, plan, cycle_index, release_sec))
                 continue
             if rc != 0:
+                task_log.record(plan, cycle_index, release_sec, now_sec, "failed", rc)
                 stderr_data = b""
                 if proc.stderr is not None:
                     stderr_data = proc.stderr.read()
@@ -617,6 +668,7 @@ def launch_simulation(
                     f"{plan.name} from cycle {cycle_index} exited with rc={rc}\n"
                     f"{stderr_data.decode('utf-8', errors='replace')}"
                 )
+            task_log.record(plan, cycle_index, release_sec, now_sec, "done", rc)
 
         task_procs[:] = running
 
@@ -629,6 +681,21 @@ def launch_simulation(
                 return
             time.sleep(min(remaining, 0.01))
 
+    def spawn_pinned(cmd: list[str], cpu: int) -> subprocess.Popen[bytes]:
+        # The child inherits the affinity of the forking thread.
+        old_mask = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, {cpu})
+        try:
+            return subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+        finally:
+            os.sched_setaffinity(0, old_mask)
+
     def launch_task(plan: TaskPlan, cycle_index: int) -> None:
         task_path = run_dir / plan.name
         cycle_offset_ms = cycle_index * deadline_ms
@@ -638,24 +705,33 @@ def launch_simulation(
             f"launch {plan.name} cpu={plan.cpu} "
             f"step={plan.freq_step_idx} freq={plan.freq_khz}"
         )
-        proc = subprocess.Popen(
-            [str(task_path), str(plan.runtime_ms)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            env=env,
-            start_new_session=True,
-        )
-        task_procs.append((proc, plan, cycle_index))
+        cmd = [str(task_path), str(plan.runtime_ms)]
+        release_sec = time.monotonic() - start_monotonic
+        if args.baseline:
+            proc = spawn_pinned(cmd, plan.cpu)
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+                start_new_session=True,
+            )
+        task_procs.append((proc, plan, cycle_index, release_sec))
 
     try:
         cycle_index = 0
-        while True:
+        stop_release = False
+        while not stop_release:
             if args.loop:
                 print(f"Starting schedule cycle {cycle_index}")
 
             cycle_start = start_monotonic + cycle_index * period_sec
             for plan in release_plans:
                 target_time = cycle_start + plan.ready_ms / 1000.0
+                if end_time is not None and target_time >= end_time:
+                    stop_release = True
+                    break
                 wait_until(target_time, "during task release")
                 launch_task(plan, cycle_index)
 
@@ -663,28 +739,39 @@ def launch_simulation(
                 break
             cycle_index += 1
 
-        failed = False
-        for proc, plan, cycle_index in task_procs:
-            rc = proc.wait()
-            if rc != 0:
-                failed = True
-                stderr_data = b""
-                if proc.stderr is not None:
-                    stderr_data = proc.stderr.read()
-                sys.stderr.write(
-                    f"{plan.name} from cycle {cycle_index} exited with rc={rc}\n"
-                    f"{stderr_data.decode('utf-8', errors='replace')}"
-                )
-            check_scheduler("before workload completion")
+        if end_time is not None:
+            wait_until(end_time, "before the end of the run")
+            killed_sec = time.monotonic() - start_monotonic
+            for proc, plan, cycle_index, release_sec in task_procs:
+                terminate_process_tree(proc)
+                task_log.record(plan, cycle_index, release_sec, None, "killed",
+                                proc.returncode)
+            task_procs.clear()
+            print(f"Run duration {args.duration:.3f} s reached at +{killed_sec:.3f} s, "
+                  "unfinished tasks killed")
+        else:
+            while task_procs:
+                check_scheduler("before workload completion")
+                reap_finished_tasks()
+                time.sleep(0.01)
+
+        counts = task_log.counts
+        print(
+            f"Task instances: done={counts['done']} missed_deadline={counts['missed']} "
+            f"killed={counts['killed']} failed={counts['failed']}"
+        )
 
         if borders_proc.poll() is None:
             terminate_process_tree(borders_proc)
+            watcher.done.wait(timeout=5.0)
 
-        return 1 if failed else 0
+        return 1 if counts["failed"] else 0
     finally:
-        for proc, _, _ in task_procs:
+        for proc, _, _, _ in task_procs:
             terminate_process_tree(proc)
         terminate_process_tree(borders_proc)
+        if task_log is not None:
+            task_log.close()
         for link_path in task_links:
             try:
                 link_path.unlink()
@@ -812,6 +899,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "period and releasing a new task set every period"
         ),
     )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        help=(
+            "Stop the run after this many seconds from the first release: "
+            "no new releases, unfinished tasks are killed, scx_borders is stopped"
+        ),
+    )
+    parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help=(
+            "Run scx_borders in monitor-only mode (-M): the kernel scheduler and "
+            "cpufreq governor stay in charge, each task is pinned to its planned CPU"
+        ),
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        help=(
+            "Write latest.csv, dbg.log, battery.csv, tasks.csv, borders.log and "
+            "static_schedule.txt of this run into this directory"
+        ),
+    )
     return parser
 
 
@@ -822,6 +933,8 @@ def main() -> int:
     try:
         if args.rounds_per_unit <= 0:
             raise SimulatorError("--rounds-per-unit must be positive")
+        if args.duration is not None and not args.duration > 0:
+            raise SimulatorError("--duration must be positive")
 
         origin_bin = args.origin.resolve()
         if not args.dry_run and not origin_bin.is_file():

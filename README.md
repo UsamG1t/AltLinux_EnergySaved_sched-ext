@@ -13,6 +13,7 @@ Based on https://github.com/sched-ext/scx, C/eBPF schedulers with frequency mana
 - `launch/scx_erf` — `scx_erf` simulator.
 - `launch/scx_scheduler` — `scx_scheduler` simulator.
 - `launch/scx_borders` — `scx_borders` simulator.
+- `launch/experiments` — experiment series runner (`run_series.py`).
 - `build` — generated binaries, BPF objects, skeletons and temporary run directories.
 - `results` — experiment outputs and plotting tools.
 
@@ -78,6 +79,69 @@ python3 results/plot_battery.py --union --log \
   results/experiment-a/battery.csv \
   results/experiment-b/battery.csv
 ```
+
+Add `-o battery.png` to save the graph to a file instead of opening a window.
+
+### Run options for comparison experiments
+
+- `--duration SEC` stops the run SEC seconds after the first release: no new
+  task is released, unfinished tasks are killed and `scx_borders` is stopped.
+- `--baseline` starts `scx_borders -M` (monitor-only): sched_ext is not
+  loaded and cpufreq is not touched, so the kernel scheduler and the active
+  cpufreq governor are measured with the same sampling code and log formats.
+  Every task is pinned to the CPU planned for it.
+- `--results-dir DIR` writes `latest.csv`, `dbg.log`, `battery.csv`,
+  `tasks.csv`, `borders.log` and `static_schedule.txt` of the run into `DIR`
+  (`scx_borders -o DIR`).
+
+`tasks.csv` has one row per task instance: release, planned start and end,
+deadline (end of its period), finish time, status (`done`, `killed`,
+`failed`) and whether the deadline was met.
+
+## Experiment series: scx_borders vs schedutil vs powersave
+
+`launch/experiments/run_series.py` runs interleaved series (as root, from the
+repository root, on battery power):
+
+| Variant | intel_pstate | governor | scheduler |
+|---|---|---|---|
+| `borders` | active | powersave | `scx_borders` |
+| `schedutil` | passive | schedutil | kernel, tasks pinned (`--baseline`) |
+| `powersave` | active | powersave | kernel, tasks pinned (`--baseline`) |
+
+```bash
+make scx_borders task_workload_origin
+sudo python3 launch/experiments/run_series.py --dry-run
+sudo python3 launch/experiments/run_series.py \
+  --repeats 5 --duration 300 --cooldown 60 \
+  --owner "$USER" --name series-01
+```
+
+The order is `borders, schedutil, powersave` repeated `--repeats` times. Before
+each run the script switches `intel_pstate/status` and the governor of every
+policy (EPP of active-mode runs is pinned to its value at the series start);
+the original state is restored at the end and on Ctrl-C. The series refuses to
+start when CPU0/CPU1 share a core with other CPUs (`--allow-smt`), when the AC
+adapter is online (`--allow-ac`) or when sched_ext is already in use.
+
+Results go to `results/experiments/<name>/`:
+
+- `manifest.json` — options, machine facts, initial and restored cpufreq state;
+- `<variant>/runNN/` — the run logs listed above, `sim.log` and
+  `run_info.json` (cpufreq, battery and temperatures before and after);
+- `summary.csv` — per run: RAPL energy per domain, battery energy used,
+  capacity, task counts and mean CPU frequency.
+
+Build all graphs of a series afterwards (matplotlib required for the series
+graphs; without it only per-run SVG graphs are written):
+
+```bash
+python3 results/plot_series.py results/experiments/series-01
+```
+
+It writes `execution.png` and `battery.png` into every run directory and
+`battery_consumed_<variant>.png`, `battery_consumed_all.png` and
+`energy_summary.png` into the series directory.
 
 ## `scx_scheduler`: calibration and run cycle
 

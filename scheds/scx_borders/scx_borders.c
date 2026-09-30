@@ -28,9 +28,9 @@
 #define MAX_TIME_IN_STATE_STEPS 64
 
 #define LOG_DIR "results/scx_borders"
-#define LOG_CSV_PATH LOG_DIR "/latest.csv"
-#define LOG_DBG_PATH LOG_DIR "/dbg.log"
-#define LOG_BATTERY_CSV_PATH LOG_DIR "/battery.csv"
+#define LOG_CSV_NAME "latest.csv"
+#define LOG_DBG_NAME "dbg.log"
+#define LOG_BATTERY_CSV_NAME "battery.csv"
 #define CPUFREQ_BOOST_PATH "/sys/devices/system/cpu/cpufreq/boost"
 #define POWER_SUPPLY_CLASS_PATH "/sys/class/power_supply"
 #define LOG_SYNC_INTERVAL_NS 1000000000ULL
@@ -273,10 +273,30 @@ static int parse_interval(const char *arg, double *interval_sec)
 	return 0;
 }
 
+static char log_dir[PATH_MAX] = LOG_DIR;
+static char log_csv_path[PATH_MAX];
+static char log_dbg_path[PATH_MAX];
+static char log_battery_csv_path[PATH_MAX];
+
+static int set_log_paths(const char *dir)
+{
+	if ((size_t)snprintf(log_dir, sizeof(log_dir), "%s", dir) >= sizeof(log_dir) ||
+	    (size_t)snprintf(log_csv_path, sizeof(log_csv_path), "%s/%s", dir,
+			     LOG_CSV_NAME) >= sizeof(log_csv_path) ||
+	    (size_t)snprintf(log_dbg_path, sizeof(log_dbg_path), "%s/%s", dir,
+			     LOG_DBG_NAME) >= sizeof(log_dbg_path) ||
+	    (size_t)snprintf(log_battery_csv_path, sizeof(log_battery_csv_path),
+			     "%s/%s", dir, LOG_BATTERY_CSV_NAME) >=
+		    sizeof(log_battery_csv_path))
+		return -ENAMETOOLONG;
+
+	return 0;
+}
+
 static int ensure_log_dir(void)
 {
-	if (mkdir(LOG_DIR, 0755) < 0 && errno != EEXIST) {
-		perror("mkdir(" LOG_DIR ")");
+	if (mkdir(log_dir, 0755) < 0 && errno != EEXIST) {
+		perror(log_dir);
 		return -errno;
 	}
 
@@ -2086,6 +2106,8 @@ int main(int argc, char **argv)
 	char fail_stage[128] = "startup";
 	int opt;
 	bool loop_enabled = false;
+	bool monitor_only = false;
+	const char *log_dir_arg = LOG_DIR;
 	int last_timer_sec = -1;
 	int ret = 0;
 
@@ -2100,7 +2122,7 @@ int main(int argc, char **argv)
 	init_freq_border_writers(border_writers);
 	init_battery_monitor(&battery_monitor);
 
-	while ((opt = getopt(argc, argv, "f:lh")) != -1) {
+	while ((opt = getopt(argc, argv, "f:lMo:h")) != -1) {
 		switch (opt) {
 		case 'f':
 			ret = parse_interval(optarg, &sample_interval_sec);
@@ -2113,9 +2135,15 @@ int main(int argc, char **argv)
 		case 'l':
 			loop_enabled = true;
 			break;
+		case 'M':
+			monitor_only = true;
+			break;
+		case 'o':
+			log_dir_arg = optarg;
+			break;
 		default:
 			fprintf(stderr,
-				"Usage: %s [-f interval_sec] [-l] <schedule_file>\n",
+				"Usage: %s [-f interval_sec] [-l] [-M] [-o log_dir] <schedule_file>\n",
 				argv[0]);
 			return opt != 'h';
 		}
@@ -2123,11 +2151,16 @@ int main(int argc, char **argv)
 
 	if (optind >= argc) {
 		fprintf(stderr,
-			"Usage: %s [-f interval_sec] [-l] <schedule_file>\n",
+			"Usage: %s [-f interval_sec] [-l] [-M] [-o log_dir] <schedule_file>\n",
 			argv[0]);
 		return 1;
 	}
 	schedule_path = argv[optind];
+
+	if (set_log_paths(log_dir_arg) < 0) {
+		fprintf(stderr, "Log directory path is too long: %s\n", log_dir_arg);
+		return 1;
+	}
 
 	ret = parse_schedule_file(schedule_path, &schedule);
 	if (ret < 0)
@@ -2144,31 +2177,41 @@ int main(int argc, char **argv)
 	control.nr_tasks = schedule.nr_plans;
 	control.loop_enabled = loop_enabled;
 
-	ret = disable_boost(&boost);
-	if (ret < 0) {
-		set_fail_stage(fail_stage, sizeof(fail_stage), "disable_boost");
-		goto out;
-	}
+	/*
+	 * Monitor-only mode keeps the kernel scheduler and the cpufreq
+	 * governor in charge: no BPF, no frequency borders, no boost change.
+	 * Sampling and log formats stay identical for comparison runs.
+	 */
+	if (!monitor_only) {
+		ret = disable_boost(&boost);
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage), "disable_boost");
+			goto out;
+		}
 
-	ret = open_freq_border_writers(border_writers);
-	if (ret < 0) {
-		set_fail_stage(fail_stage, sizeof(fail_stage),
-			       "open_freq_border_writers");
-		goto out;
+		ret = open_freq_border_writers(border_writers);
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage),
+				       "open_freq_border_writers");
+			goto out;
+		}
 	}
 
 restart:
-	skel = SCX_OPS_OPEN(borders_ops, scx_borders);
-	SCX_OPS_LOAD(skel, borders_ops, scx_borders, uei);
+	if (!monitor_only) {
+		skel = SCX_OPS_OPEN(borders_ops, scx_borders);
+		SCX_OPS_LOAD(skel, borders_ops, scx_borders, uei);
 
-	ret = load_borders_maps(skel, &control, schedule.plans,
-				 schedule.nr_plans);
-	if (ret < 0) {
-		set_fail_stage(fail_stage, sizeof(fail_stage), "load_borders_maps");
-		goto out;
+		ret = load_borders_maps(skel, &control, schedule.plans,
+					 schedule.nr_plans);
+		if (ret < 0) {
+			set_fail_stage(fail_stage, sizeof(fail_stage),
+				       "load_borders_maps");
+			goto out;
+		}
+
+		link = SCX_OPS_ATTACH(skel, borders_ops, scx_borders);
 	}
-
-	link = SCX_OPS_ATTACH(skel, borders_ops, scx_borders);
 
 	ret = ensure_log_dir();
 	if (ret < 0) {
@@ -2178,29 +2221,30 @@ restart:
 
 	rapl_open(&rapl);
 
-	csv = open_log_file(LOG_CSV_PATH);
+	csv = open_log_file(log_csv_path);
 	if (!csv) {
 		ret = -errno;
 		set_fail_stage(fail_stage, sizeof(fail_stage),
-			       "open_log_file(%s)", LOG_CSV_PATH);
+			       "open_log_file(%s)", log_csv_path);
 		goto out;
 	}
 	write_csv_header(csv, &rapl);
 
-	dbg = open_log_file(LOG_DBG_PATH);
+	dbg = open_log_file(log_dbg_path);
 	if (!dbg) {
 		ret = -errno;
 		set_fail_stage(fail_stage, sizeof(fail_stage),
-			       "open_log_file(%s)", LOG_DBG_PATH);
+			       "open_log_file(%s)", log_dbg_path);
 		goto out;
 	}
-	fprintf(dbg, "run: loop=%u period_ns=%llu\n", control.loop_enabled,
-		(unsigned long long)control.deadline_ns);
-	battery_csv = open_log_file(LOG_BATTERY_CSV_PATH);
+	fprintf(dbg, "run: loop=%u period_ns=%llu monitor_only=%d\n",
+		control.loop_enabled, (unsigned long long)control.deadline_ns,
+		monitor_only);
+	battery_csv = open_log_file(log_battery_csv_path);
 	if (!battery_csv) {
 		ret = -errno;
 		set_fail_stage(fail_stage, sizeof(fail_stage),
-			       "open_log_file(%s)", LOG_BATTERY_CSV_PATH);
+			       "open_log_file(%s)", log_battery_csv_path);
 		goto out;
 	}
 	write_battery_csv_header(battery_csv);
@@ -2249,13 +2293,15 @@ restart:
 	       ISOLATED_START, ISOLATED_END, sample_interval_sec);
 	printf("Sample format: policy|scaling_cur/cpuinfo_avg MHz\n");
 	rapl_print_domains(&rapl);
-	printf("Logging samples to %s\n", LOG_CSV_PATH);
-	printf("Logging debug samples to %s\n", LOG_DBG_PATH);
+	printf("Logging samples to %s\n", log_csv_path);
+	printf("Logging debug samples to %s\n", log_dbg_path);
 	if (control.loop_enabled)
 		printf("Loop mode enabled, period %.3f ms\n",
 		       (double)control.deadline_ns / 1000000.0);
+	if (monitor_only)
+		printf("Monitor-only mode: sched_ext is not loaded, cpufreq is not touched\n");
 
-	while (!exit_req && !UEI_EXITED(skel, uei)) {
+	while (!exit_req && (monitor_only || !UEI_EXITED(skel, uei))) {
 		bool policy_valid[NR_ISOLATED_CPUS] = {};
 		bool scaling_valid[NR_ISOLATED_CPUS] = {};
 		bool avg_valid[NR_ISOLATED_CPUS] = {};
@@ -2286,18 +2332,20 @@ restart:
 
 		rapl_sample(&rapl);
 
-		ret = read_borders_debug_states(skel, debug_states);
-		if (ret < 0) {
-			set_fail_stage(fail_stage, sizeof(fail_stage),
-				       "read_borders_debug_states");
-			goto out;
-		}
+		if (!monitor_only) {
+			ret = read_borders_debug_states(skel, debug_states);
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "read_borders_debug_states");
+				goto out;
+			}
 
-		ret = apply_freq_borders(border_writers, debug_states);
-		if (ret < 0) {
-			set_fail_stage(fail_stage, sizeof(fail_stage),
-				       "apply_freq_borders");
-			goto out;
+			ret = apply_freq_borders(border_writers, debug_states);
+			if (ret < 0) {
+				set_fail_stage(fail_stage, sizeof(fail_stage),
+					       "apply_freq_borders");
+				goto out;
+			}
 		}
 
 		for (i = 0; i < NR_ISOLATED_CPUS; i++) {
